@@ -249,8 +249,25 @@ func TestCodexMeteringMissingFinalIsUnavailable(t *testing.T) {
 	if strings.Contains(string(body), `"status":"exact"`) {
 		t.Fatalf("missing final usage was reported as exact: %s", body)
 	}
-	if len(manager.PoolInFlightSnapshot()) != 0 {
-		t.Fatal("lease leak after interrupted stream")
+	// Releasing the lease happens on the stream owner's goroutine, so asserting
+	// the registry is empty must tolerate that bounded handoff.
+	if !waitForEmptyPoolLeases(manager, 3*time.Second) {
+		t.Fatalf("lease leak after interrupted stream: %+v", manager.PoolInFlightSnapshot())
+	}
+}
+
+// waitForEmptyPoolLeases reports whether the in-flight registry drained within
+// the bound, so a leaked lease still fails while a lagging release does not.
+func waitForEmptyPoolLeases(manager *coreauth.Manager, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if len(manager.PoolInFlightSnapshot()) == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
