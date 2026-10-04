@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"testing"
 
@@ -38,12 +39,33 @@ func TestCodexMeteringGolden(t *testing.T) {
 	}
 }
 
+// Only a caller that opts in with the metering request header gets an augmented
+// response; every other client keeps the exact upstream payload.
+func TestCodexMeteringEnvelopeRequiresOptIn(t *testing.T) {
+	raw := []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}`)
+	reporter := NewUsageReporter(context.Background(), "codex", "synthetic-model", nil)
+	if got := AnnotateCodexMetering(raw, reporter, false); string(got) != string(raw) {
+		t.Fatalf("unrequested metering changed the payload: %s", got)
+	}
+	requested := http.Header{}
+	requested.Set("X-Codex-Metering", "v1")
+	if !CodexMeteringRequested(context.Background(), requested) {
+		t.Fatal("request header did not opt in")
+	}
+	if CodexMeteringRequested(context.Background(), http.Header{}) {
+		t.Fatal("bare request opted in")
+	}
+	if gjson.GetBytes(AnnotateCodexMetering(raw, reporter, true), "response.usage.codex_metering").Raw == "" {
+		t.Fatal("missing envelope for an opted-in caller")
+	}
+}
+
 func TestCodexMeteringSurvivesDefaultsAndChatConversion(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"response.completed","response":{"id":"synthetic","model":"synthetic-model","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":30},"output_tokens_details":{"reasoning_tokens":7}}}}`,
 		`{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":0,"total_tokens":100}}}`,
 	} {
-		annotated := AnnotateCodexMetering([]byte(raw), NewUsageReporter(context.Background(), "codex", "synthetic-model", nil))
+		annotated := AnnotateCodexMetering([]byte(raw), NewUsageReporter(context.Background(), "codex", "synthetic-model", nil), true)
 		want := gjson.GetBytes(annotated, "response.usage.codex_metering").Raw
 		if want == "" {
 			t.Fatal("missing envelope")

@@ -83,6 +83,10 @@ type codexWebsocketSession struct {
 	lastEventMu   sync.Mutex
 	lastEventConn *websocket.Conn
 	lastEventType string
+
+	terminalReadMu   sync.Mutex
+	terminalReadConn *websocket.Conn
+	terminalRead     bool
 }
 
 type codexWebsocketRead struct {
@@ -110,6 +114,9 @@ func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWeb
 		s.activeCancel = activeCancel
 	}
 	s.activeMu.Unlock()
+	if conn != nil {
+		s.clearTerminalReadDelivered(conn)
+	}
 }
 
 func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsocketRead {
@@ -227,7 +234,9 @@ func (s *codexWebsocketSession) isMultiAgentV2Optimized(conn *websocket.Conn) bo
 	return s.conn == conn && s.multiAgentV2OptimizedConn == conn
 }
 
-// sendTerminalWebsocketRead reports whether it invalidated a full channel's connection before waiting.
+// sendTerminalWebsocketRead reports whether it invalidated a full channel's
+// connection before waiting. The caller decides whether a successful hand-off
+// transfers the execution lifecycle to that consumer.
 func sendTerminalWebsocketRead(ch chan<- codexWebsocketRead, done <-chan struct{}, event codexWebsocketRead, invalidate func()) bool {
 	select {
 	case ch <- event:
@@ -464,6 +473,49 @@ func (s *codexWebsocketSession) setLastEventType(conn *websocket.Conn, eventType
 	s.lastEventMu.Unlock()
 }
 
+// markTerminalReadDelivered records that the read loop handed its final read to a
+// live consumer. The consumer then owns the execution lifecycle, because ending
+// the lease while it drains a completed response would cancel that response.
+func (s *codexWebsocketSession) markTerminalReadDelivered(conn *websocket.Conn) {
+	if s == nil || conn == nil {
+		return
+	}
+	s.terminalReadMu.Lock()
+	s.terminalReadConn = conn
+	s.terminalRead = true
+	s.terminalReadMu.Unlock()
+}
+
+// takeTerminalReadDelivered consumes the hand-off record, so the consumer owns the
+// lifecycle exactly once.
+func (s *codexWebsocketSession) takeTerminalReadDelivered(conn *websocket.Conn) bool {
+	if s == nil || conn == nil {
+		return false
+	}
+	s.terminalReadMu.Lock()
+	delivered := s.terminalRead && s.terminalReadConn == conn
+	if delivered {
+		s.terminalReadConn = nil
+		s.terminalRead = false
+	}
+	s.terminalReadMu.Unlock()
+	return delivered
+}
+
+// clearTerminalReadDelivered forgets a hand-off once the connection is retired or
+// replaced, so a later connection cannot inherit the previous reader's ownership.
+func (s *codexWebsocketSession) clearTerminalReadDelivered(conn *websocket.Conn) {
+	if s == nil {
+		return
+	}
+	s.terminalReadMu.Lock()
+	if conn == nil || s.terminalReadConn == conn {
+		s.terminalReadConn = nil
+		s.terminalRead = false
+	}
+	s.terminalReadMu.Unlock()
+}
+
 func (s *codexWebsocketSession) getLastEventType(conn *websocket.Conn) string {
 	if s == nil || conn == nil {
 		return ""
@@ -670,19 +722,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			invalidate := func() {
+			if ch := e.handOffUpstreamTerminalRead(sess, conn, errRead); ch != nil {
+				e.invalidateUpstreamConnAfterTerminalHandoff(sess, conn, "upstream_disconnected", errRead, e.endUpstreamReadLoop(sess, ch, conn))
+			} else {
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
-			}
-			invalidated := false
-			ch, done := sess.activeForConn(conn)
-			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
-				if sess.clearActive(conn, ch) {
-					close(ch)
-				}
-			}
-			if !invalidated {
-				invalidate()
 			}
 			return
 		}
@@ -690,19 +733,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
-				invalidate := func() {
+				if ch := e.handOffUpstreamTerminalRead(sess, conn, errBinary); ch != nil {
+					e.invalidateUpstreamConnAfterTerminalHandoff(sess, conn, "unexpected_binary", errBinary, e.endUpstreamReadLoop(sess, ch, conn))
+				} else {
 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
-				}
-				invalidated := false
-				ch, done := sess.activeForConn(conn)
-				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
-					if sess.clearActive(conn, ch) {
-						close(ch)
-					}
-				}
-				if !invalidated {
-					invalidate()
 				}
 				return
 			}
@@ -728,15 +762,52 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	}
 }
 
+// handOffUpstreamTerminalRead passes the read-loop's final event to the active
+// consumer and reports the channel that took over the execution lifecycle. Ending
+// a lease while its consumer is still draining a completed response would cancel
+// the authoritative usage instead of settling it.
+func (e *CodexWebsocketsExecutor) handOffUpstreamTerminalRead(sess *codexWebsocketSession, conn *websocket.Conn, err error) chan codexWebsocketRead {
+	ch, done := sess.activeForConn(conn)
+	if ch == nil {
+		return nil
+	}
+	// The event is already buffered in the channel when this returns, so the
+	// consumer observes it even if its context ends in between.
+	_ = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: err}, nil)
+	if active, _ := sess.activeForConn(conn); active == ch {
+		sess.markTerminalReadDelivered(conn)
+	}
+	return ch
+}
+
+// endUpstreamReadLoop retires the reader and reports whether the consumer already
+// took over the execution lifecycle through a delivered terminal read. That
+// consumer disposes of the lifecycle once the payload is delivered; ending the
+// lease from here would cancel the response it is still draining.
+func (e *CodexWebsocketsExecutor) endUpstreamReadLoop(sess *codexWebsocketSession, ch chan codexWebsocketRead, conn *websocket.Conn) bool {
+	handedOff := sess.takeTerminalReadDelivered(conn)
+	if sess.clearActive(conn, ch) {
+		close(ch)
+	}
+	return handedOff
+}
+
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true)
+	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true, false)
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithoutDisconnectNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false)
+	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false, false)
 }
 
-func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool) {
+// invalidateUpstreamConnAfterTerminalHandoff retires a connection whose reader
+// already passed its final payload to a consumer. The consumer owns the execution
+// lifecycle until that payload is delivered, so the lease must not be ended here.
+func (e *CodexWebsocketsExecutor) invalidateUpstreamConnAfterTerminalHandoff(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, handedOff bool) {
+	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true, handedOff)
+}
+
+func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool, terminalHandedOff bool) {
 	if sess == nil || conn == nil {
 		return
 	}
@@ -771,6 +842,13 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 		if errClose := closer.Close(); errClose != nil {
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 		}
+	}
+	// The read loop hands its terminal read to the consumer before invalidating the
+	// connection. An active consumer still owns the lifecycle until the payload is
+	// delivered, so a disconnect it already observed must not end the lease early.
+	// A revoke keeps its own path: it never delivers a terminal read first.
+	if terminalHandedOff {
+		return
 	}
 	if lifecycle != nil {
 		lifecycle.End(reason)

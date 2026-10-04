@@ -129,7 +129,7 @@ func TestClearRetryActiveStateClearsOriginalConnection(t *testing.T) {
 	}
 }
 
-func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
+func TestWebsocketPayloadWriteFailureClearsActiveSessionState(t *testing.T) {
 	tests := []struct {
 		name string
 		run  func(t *testing.T, baseURL string) (func(cliproxyexecutor.Options) error, *codexWebsocketSession)
@@ -260,24 +260,22 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, ExecutionLifecycle: lifecycle, Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "retry-bind"}}
 			run, sess := test.run(t, server.URL)
 			if errRun := run(opts); errRun == nil {
-				t.Fatal("first request error = nil, want retry lifecycle bind rejection")
+				t.Fatal("first request error = nil, want the synthetic write failure")
 			}
-			if got := lifecycle.binds.Load(); got != 2 {
-				t.Fatalf("lifecycle binds = %d, want 2", got)
+			// A failed payload write may already have reached upstream: Codex stops
+			// there instead of rebinding and replaying, and xAI still retries once.
+			wantBinds := int32(1)
+			if test.name == "xAI stream" {
+				wantBinds = 2
+			}
+			if got := lifecycle.binds.Load(); got != wantBinds {
+				t.Fatalf("lifecycle binds = %d, want %d", got, wantBinds)
 			}
 			sess.activeMu.Lock()
 			active := sess.activeConn != nil || sess.activeCh != nil || sess.activeDone != nil || sess.activeCancel != nil
 			sess.activeMu.Unlock()
 			if active {
-				t.Fatal("retry bind failure left the old active websocket state")
-			}
-
-			opts.ExecutionLifecycle = nil
-			if errRun := run(opts); errRun != nil {
-				t.Fatalf("second request error = %v", errRun)
-			}
-			if got := connections.Load(); got != 3 {
-				t.Fatalf("websocket connections = %d, want 3 after retry bind failure", got)
+				t.Fatal("payload write failure left the old active websocket state")
 			}
 		})
 	}

@@ -283,11 +283,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				continue
 			}
+			helps.ObserveCodexUpstreamWork(ctx, payload)
 			observeCodexTokenEvent(reporter, payload)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 			payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgentV2)
-			payload = helps.AnnotateCodexMetering(payload, reporter)
+			payload = helps.AnnotateCodexMetering(payload, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 
 			if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
 				if sess != nil {
@@ -462,6 +463,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if isEphemeralSession {
 				closeCodexWebsocketSession(sess, "completed")
 			}
+			// The terminal payload is already buffered into out below. The lifecycle is
+			// ended by whoever finishes delivering that buffer (the pool wrapper's lease
+			// on close, or the consumer's own teardown); ending it here would cancel the
+			// stream this call is about to hand over.
 		} else {
 			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, "completed", nil)
 			if errClose := closer.Close(); errClose != nil {
@@ -548,11 +553,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
+			helps.ObserveCodexUpstreamWork(ctx, payload)
 			observeCodexTokenEvent(reporter, payload)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 			payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgentV2)
-			payload = helps.AnnotateCodexMetering(payload, reporter)
+			payload = helps.AnnotateCodexMetering(payload, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 
 			if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
 				terminateReason = "upstream_error"

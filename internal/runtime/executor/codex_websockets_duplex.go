@@ -440,6 +440,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				outputItems = make(map[int64][]byte)
 				outputFallback = nil
 			}
+			helps.ObserveCodexUpstreamWork(ctx, payload)
 			observeCodexTokenEvent(reporter, payload)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
@@ -585,7 +586,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					reporter.EnsurePublished(ctx)
 				}
 			}
-			payload = helps.AnnotateCodexMetering(payload, reporter)
+			payload = helps.AnnotateCodexMetering(payload, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 			if !send(cliproxyexecutor.StreamChunk{Payload: helps.EnsureResponsesUsageDetails(payload)}) {
 				return
 			}

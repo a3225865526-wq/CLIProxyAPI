@@ -237,11 +237,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
+		helps.ObserveCodexUpstreamWork(ctx, payload)
 		observeCodexTokenEvent(reporter, payload)
 		helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 		helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 		payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgentV2)
-		payload = helps.AnnotateCodexMetering(payload, reporter)
+		payload = helps.AnnotateCodexMetering(payload, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 
 		if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
 			if sess != nil {

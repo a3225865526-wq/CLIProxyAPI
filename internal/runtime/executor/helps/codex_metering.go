@@ -1,11 +1,14 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
+	"github.com/gin-gonic/gin"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -13,7 +16,13 @@ import (
 
 // AnnotateCodexMetering runs before protocol conversion/default synthesis.
 // Only response objects carry the extension; delta counters are not usage.
-func AnnotateCodexMetering(payload []byte, reporter *UsageReporter) []byte {
+// The envelope augments the response usage object, so it is emitted only for
+// upstream clients that opt in with the metering request header; every other
+// client keeps the exact upstream payload.
+func AnnotateCodexMetering(payload []byte, reporter *UsageReporter, requested bool) []byte {
+	if !requested {
+		return payload
+	}
 	root := gjson.ParseBytes(payload)
 	path := "usage"
 	if root.Get("response").IsObject() {
@@ -47,6 +56,20 @@ func AnnotateCodexMetering(payload []byte, reporter *UsageReporter) []byte {
 	return updated
 }
 
+// ObserveCodexUpstreamWork records that an attempt produced billable upstream
+// work: generated output or an authoritative usage object. An attempt that only
+// returned a rejection has nothing to bill, so failing it over to another
+// credential stays safe; an attempt that already generated output does not.
+func ObserveCodexUpstreamWork(ctx context.Context, payload []byte) {
+	if !HasMeaningfulCodexOutputDelta(payload) {
+		root := gjson.ParseBytes(payload)
+		if !root.Get("response.usage").IsObject() && !root.Get("usage").IsObject() {
+			return
+		}
+	}
+	cliproxyexecutor.MarkUpstreamWork(ctx)
+}
+
 func CodexMeteringHeaders(headers http.Header) http.Header {
 	result := headers.Clone()
 	if result == nil {
@@ -54,4 +77,16 @@ func CodexMeteringHeaders(headers http.Header) http.Header {
 	}
 	result.Set("X-Codex-Metering", "v1")
 	return result
+}
+
+// CodexMeteringRequested reports whether the caller consumes the versioned
+// metering envelope. The proxy only augments response usage for such callers.
+func CodexMeteringRequested(ctx context.Context, headers http.Header) bool {
+	if headers.Get("X-Codex-Metering") == "v1" {
+		return true
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return ginCtx.Request.Header.Get("X-Codex-Metering") == "v1"
+	}
+	return false
 }

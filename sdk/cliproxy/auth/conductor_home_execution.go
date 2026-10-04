@@ -242,7 +242,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			startHomeExec := time.Now()
 			response, errExecute = execute()
 			errExecute = markUpstreamExecutionAttemptFromContext(execCtx, errExecute)
-			if !countTokens && selection.Provider == "codex" && errExecute != nil && cliproxyexecutor.UpstreamAttempted(execCtx) {
+			if !countTokens && selection.Provider == "codex" && errExecute != nil && cliproxyexecutor.UpstreamWorkObserved(execCtx) {
 				releaseAttempt()
 				return cliproxyexecutor.Response{}, wrapRequestStopError(errExecute)
 			}

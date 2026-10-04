@@ -11,6 +11,7 @@ type upstreamAttemptTrackerContextKey struct{}
 
 type upstreamAttemptTracker struct {
 	attempted atomic.Bool
+	work      atomic.Bool
 }
 
 // WithDownstreamWebsocket marks the current request as coming from a downstream websocket connection.
@@ -76,4 +77,29 @@ func UpstreamAttempted(ctx context.Context) bool {
 	}
 	tracker, ok := ctx.Value(upstreamAttemptTrackerContextKey{}).(*upstreamAttemptTracker)
 	return ok && tracker != nil && tracker.attempted.Load()
+}
+
+// MarkUpstreamWork records that the current attempt produced an observable upstream
+// response payload. Replaying such an attempt on another credential may bill the
+// user twice, while a transport attempt that returned nothing billable can fail
+// over safely.
+func MarkUpstreamWork(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	tracker, ok := ctx.Value(upstreamAttemptTrackerContextKey{}).(*upstreamAttemptTracker)
+	if !ok || tracker == nil {
+		return
+	}
+	tracker.work.Store(true)
+}
+
+// UpstreamWorkObserved reports whether the tracked provider execution already
+// received an upstream response payload for this attempt.
+func UpstreamWorkObserved(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	tracker, ok := ctx.Value(upstreamAttemptTrackerContextKey{}).(*upstreamAttemptTracker)
+	return ok && tracker != nil && tracker.work.Load()
 }

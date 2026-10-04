@@ -138,8 +138,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		eventData := bytes.TrimSpace(line[5:])
+		helps.ObserveCodexUpstreamWork(ctx, eventData)
 		eventData = helps.RestoreCodexMultiAgentV2Response(eventData, optimizeMultiAgentV2)
-		eventData = helps.AnnotateCodexMetering(eventData, reporter)
+		eventData = helps.AnnotateCodexMetering(eventData, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 		reporter.ObserveCodexResponseModel(eventData)
 		eventType := gjson.GetBytes(eventData, "type").String()
 
@@ -299,7 +300,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	upstreamData := helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
-	upstreamData = helps.AnnotateCodexMetering(upstreamData, reporter)
+	helps.ObserveCodexUpstreamWork(ctx, upstreamData)
+	upstreamData = helps.AnnotateCodexMetering(upstreamData, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 	detail := helps.ParseOpenAIUsage(upstreamData)
 	detail.CodexMetering = usage.ParseCodexMetering([]byte(gjson.GetBytes(upstreamData, "usage").Raw))
 	reporter.Publish(ctx, detail)

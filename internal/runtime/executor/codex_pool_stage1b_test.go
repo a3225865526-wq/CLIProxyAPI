@@ -103,7 +103,7 @@ func TestCodexMeteringPoolHTTPAndWebsocket(t *testing.T) {
 					ctx = coreexecutor.WithDownstreamWebsocket(ctx)
 				}
 				req := coreexecutor.Request{Model: "synthetic-native", Payload: []byte(`{"model":"synthetic-native","input":"synthetic"}`)}
-				opts := coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+				opts := coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"X-Codex-Metering": {"v1"}}}
 				var body []byte
 				if stream {
 					result, err := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
@@ -131,6 +131,166 @@ func TestCodexMeteringPoolHTTPAndWebsocket(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+const codexPoolStage2Final = `{"type":"response.completed","response":{"id":"synthetic-stage2","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":30},"output_tokens_details":{"reasoning_tokens":7}}}}`
+
+// codexMeteringAfterTerminalServer serves one Codex turn whose terminal usage
+// event is followed by either an immediate connection close or a stall, so both
+// the EOF race and the interrupted-stream path stay deterministic.
+func codexMeteringAfterTerminalServer(t *testing.T, kind string, stream bool, closeAfterTerminal bool) (*httptest.Server, <-chan struct{}) {
+	t.Helper()
+	terminalSent := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if kind == "http" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", codexPoolStage2Final)
+			if stream {
+				w.(http.Flusher).Flush()
+			}
+			close(terminalSent)
+			if !closeAfterTerminal {
+				<-r.Context().Done()
+			}
+			return
+		}
+		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexPoolStage2Final))
+		close(terminalSent)
+		if !closeAfterTerminal {
+			_, _, _ = conn.ReadMessage()
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, terminalSent
+}
+
+// An upstream that closes right after its terminal usage event must not have that
+// event cancelled by the read loop's own disconnect handling.
+func TestCodexMeteringSurvivesTerminalCloseRace(t *testing.T) {
+	for _, kind := range []string{"http", "websocket"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", kind, stream), func(t *testing.T) {
+				server, terminalSent := codexMeteringAfterTerminalServer(t, kind, stream, true)
+				manager, _ := codexPoolFixture(t, server.URL, kind == "websocket")
+				ctx := context.Background()
+				if kind == "websocket" {
+					ctx = coreexecutor.WithDownstreamWebsocket(ctx)
+				}
+				req := coreexecutor.Request{Model: "synthetic-native", Payload: []byte(`{"model":"synthetic-native","input":"synthetic"}`)}
+				opts := coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"X-Codex-Metering": {"v1"}}}
+				var body []byte
+				if stream {
+					result, err := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+						body = append(body, chunk.Payload...)
+					}
+				} else {
+					result, err := manager.Execute(ctx, []string{"codex"}, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body = result.Payload
+				}
+				<-terminalSent
+				if !strings.Contains(string(body), `"status":"exact"`) || !strings.Contains(string(body), `"cached_input_tokens":30`) {
+					t.Fatalf("terminal close discarded authoritative usage: %s", body)
+				}
+				if len(manager.PoolInFlightSnapshot()) != 0 {
+					t.Fatal("lease leak after terminal close")
+				}
+			})
+		}
+	}
+}
+
+// An upstream that ends without any authoritative usage must be reported as
+// unavailable, never as an exact zero bill.
+func TestCodexMeteringMissingFinalIsUnavailable(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"synthetic\"}}\n\n"))
+		w.(http.Flusher).Flush()
+	}))
+	defer server.Close()
+	manager, _ := codexPoolFixture(t, server.URL, false)
+	request := coreexecutor.Request{Model: "synthetic-native", Payload: []byte(`{"model":"synthetic-native","input":"synthetic"}`)}
+	opts := coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"X-Codex-Metering": {"v1"}}}
+	result, errStream := manager.ExecuteStream(context.Background(), []string{"codex"}, request, opts)
+	var body []byte
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			break
+		}
+		body = append(body, chunk.Payload...)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("synthetic upstream calls = %d, want 1", calls.Load())
+	}
+	if strings.Contains(string(body), `"status":"exact"`) {
+		t.Fatalf("missing final usage was reported as exact: %s", body)
+	}
+	if len(manager.PoolInFlightSnapshot()) != 0 {
+		t.Fatal("lease leak after interrupted stream")
+	}
+}
+
+// A revoke that lands after the terminal usage event still settles exactly once
+// with the receipt the lease observed, instead of inventing usage or replaying.
+func TestCodexMeteringRevokeAfterTerminalKeepsExactReceipt(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", codexPoolStage2Final)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	manager, auth := codexPoolFixture(t, server.URL, false)
+	manager.SetRetryConfig(3, 0, 3)
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Execute(context.Background(), []string{"codex"}, coreexecutor.Request{Model: "synthetic-native", Payload: []byte(`{"model":"synthetic-native","input":"synthetic"}`)}, coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Headers: http.Header{"X-Codex-Metering": {"v1"}}})
+		result <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(manager.PoolInFlightSnapshot()) != 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	revokeCodexPool(t, manager, auth)
+	select {
+	case err := <-result:
+		if err != nil && !errors.Is(err, coreauth.ErrAccountRevoked) {
+			t.Fatalf("unexpected revoke outcome: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("local request did not terminate")
+	}
+	if calls.Load() != 1 || len(manager.PoolInFlightSnapshot()) != 0 {
+		t.Fatal("revoke replayed upstream or leaked a lease")
 	}
 }
 

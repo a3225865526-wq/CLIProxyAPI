@@ -193,8 +193,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				isHandshake = true
 			} else if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				helps.ObserveCodexUpstreamWork(ctx, data)
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
-				data = helps.AnnotateCodexMetering(data, reporter)
+				data = helps.AnnotateCodexMetering(data, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 				observeCodexTokenEvent(reporter, data)
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
@@ -365,8 +366,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				translatedLine = transformed
 			} else if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				helps.ObserveCodexUpstreamWork(ctx, data)
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
-				data = helps.AnnotateCodexMetering(data, reporter)
+				data = helps.AnnotateCodexMetering(data, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
 				observeCodexTokenEvent(reporter, data)
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
