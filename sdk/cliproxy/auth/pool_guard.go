@@ -278,6 +278,10 @@ func (executor *poolExecutor) PrepareRequestAuth(context.Context, *Auth) (*Auth,
 	return nil, ErrPoolGuard
 }
 
+func (executor *poolExecutor) PrepareRequest(*http.Request, *Auth) error {
+	return ErrPoolGuard
+}
+
 func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, stream bool, consumeAttempt bool) (func(), error) {
 	guard := executor.manager.poolGuard
 	guard.mu.RLock()

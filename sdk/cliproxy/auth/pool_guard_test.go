@@ -134,6 +134,12 @@ func TestPoolGuardCandidateAndSendRecheck(t *testing.T) {
 	if err == nil || executor.calls.Load() != 1 {
 		t.Fatal("raw credentialed HTTP bypass executed")
 	}
+	if err := m.InjectCredentials(&http.Request{}, auth.ID); err == nil {
+		t.Fatal("raw credential injection silently succeeded")
+	}
+	if err := m.PrepareHttpRequest(context.Background(), auth, &http.Request{}); err == nil {
+		t.Fatal("raw credential preparation succeeded")
+	}
 }
 
 func TestPoolGuardRejectsManifestFailuresAndCredentialChange(t *testing.T) {
