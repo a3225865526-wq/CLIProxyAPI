@@ -50,14 +50,21 @@ func poolGuardFixture(t *testing.T, role string) (*Manager, *poolProbeExecutor, 
 		t.Fatal(err)
 	}
 	file := filepath.Join(root, "grants.json")
+	checkpoint := filepath.Join(root, "checkpoint.jsonl")
 	t.Setenv("CLEARAPI_POOL_ROLE", role)
 	t.Setenv("CLEARAPI_POOL_ADMISSION_FILE", file)
+	t.Setenv("CLEARAPI_POOL_EXECUTOR_ID", "synthetic-executor")
+	t.Setenv("CLEARAPI_POOL_CHECKPOINT_FILE", checkpoint)
+	if err := ProvisionPoolCheckpoint(checkpoint, "synthetic-executor"); err != nil {
+		t.Fatal(err)
+	}
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(&internalconfig.Config{AuthDir: dir})
 	executor := &poolProbeExecutor{stream: make(chan cliproxyexecutor.StreamChunk)}
 	m.RegisterExecutor(executor)
 	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused"}}
 	record := PoolGrantFile{GuardVersion: PoolGuardVersion, Revision: 1, Grants: []PoolGrant{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth), Models: []string{"synthetic-native"}, Capabilities: []string{"text_chat", "stream_text", "exact_usage"}, Enabled: true, MaxConcurrency: 1, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(), SourceEvidence: []string{"synthetic-source"}, TestEvidence: []string{"synthetic-test"}}}}
+	record.ExecutorID = "synthetic-executor"
 	writePoolGrant(t, file, record)
 	registered, err := m.Register(context.Background(), auth)
 	if err != nil {
@@ -146,6 +153,7 @@ func TestPoolGuardRejectsManifestFailuresAndCredentialChange(t *testing.T) {
 	for _, scenario := range []string{"expired", "wrong-digest", "duplicate", "missing-evidence", "old-version", "inside-auth-dir", "corrupt"} {
 		t.Run(scenario, func(t *testing.T) {
 			m, executor, _, file, record := poolGuardFixture(t, "service")
+			record.Revision++
 			switch scenario {
 			case "expired":
 				record.Grants[0].ExpiresAt = time.Now().Add(-time.Minute).Unix()

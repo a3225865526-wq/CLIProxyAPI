@@ -6,7 +6,7 @@ func firstPoolGrantModel(manager *Manager, auth *Auth) string {
 	if auth == nil || manager.poolGuard == nil {
 		return ""
 	}
-	record, err := manager.poolGuard.grants()
+	record, err := manager.poolGrants()
 	if err != nil {
 		return ""
 	}

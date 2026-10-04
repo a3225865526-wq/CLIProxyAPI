@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-const PoolGuardVersion = 1
+const PoolGuardVersion = 2
 
 type poolAdmissionError struct{}
 
@@ -64,6 +65,7 @@ type PoolGrant struct {
 
 type PoolGrantFile struct {
 	GuardVersion int         `json:"guard_version"`
+	ExecutorID   string      `json:"executor_id"`
 	Revision     uint64      `json:"revision"`
 	Grants       []PoolGrant `json:"grants"`
 }
@@ -71,10 +73,14 @@ type PoolGrantFile struct {
 type poolGuard struct {
 	role         string
 	file         string
+	executorID   string
+	checkpoint   string
+	journalMu    sync.Mutex
 	mu           sync.RWMutex
 	countsMu     sync.Mutex
 	counts       map[string]int
 	lastRevision uint64
+	lastDigest   string
 }
 
 func newPoolGuard() *poolGuard {
@@ -82,7 +88,7 @@ func newPoolGuard() *poolGuard {
 	if role == "" {
 		return nil
 	}
-	return &poolGuard{role: role, file: os.Getenv("CLEARAPI_POOL_ADMISSION_FILE"), counts: make(map[string]int)}
+	return &poolGuard{role: role, file: os.Getenv("CLEARAPI_POOL_ADMISSION_FILE"), executorID: strings.TrimSpace(os.Getenv("CLEARAPI_POOL_EXECUTOR_ID")), checkpoint: os.Getenv("CLEARAPI_POOL_CHECKPOINT_FILE"), counts: make(map[string]int)}
 }
 
 func (m *Manager) PoolRole() string {
@@ -135,20 +141,61 @@ func (guard *poolGuard) grants() (*PoolGrantFile, error) {
 	var record PoolGrantFile
 	decoder := json.NewDecoder(io.LimitReader(file, 1024*1024+1))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&record) != nil || record.GuardVersion != PoolGuardVersion || record.Revision < 1 || len(record.Grants) > 1024 {
+	if decoder.Decode(&record) != nil || record.GuardVersion != PoolGuardVersion || record.ExecutorID != guard.executorID || !validPoolExecutorID(guard.executorID) || record.Revision < 1 || len(record.Grants) > 1024 {
 		return nil, ErrPoolGuard
 	}
 	var extra any
 	if decoder.Decode(&extra) != io.EOF {
 		return nil, ErrPoolGuard
 	}
-	guard.countsMu.Lock()
-	defer guard.countsMu.Unlock()
-	if record.Revision < guard.lastRevision {
+	return &record, nil
+}
+
+func (m *Manager) poolGrants() (*PoolGrantFile, error) {
+	guard := m.poolGuard
+	if guard == nil || guard.role != "service" || guard.checkpoint == "" {
 		return nil, ErrPoolGuard
 	}
-	guard.lastRevision = record.Revision
-	return &record, nil
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || cfg.AuthDir == "" {
+		return nil, ErrPoolGuard
+	}
+	root, err := filepath.Abs(cfg.AuthDir)
+	if err == nil {
+		root, err = filepath.EvalSymlinks(root)
+	}
+	if err != nil {
+		return nil, ErrPoolGuard
+	}
+	if runtime.GOOS == "windows" {
+		root = strings.ToLower(root)
+	}
+	paths := make([]string, 0, 2)
+	for _, path := range []string{guard.file, guard.checkpoint} {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, ErrPoolGuard
+		}
+		resolved, err := filepath.EvalSymlinks(absolute)
+		if runtime.GOOS == "windows" {
+			resolved = strings.ToLower(resolved)
+		}
+		if err != nil || resolved == root || strings.HasPrefix(resolved, root+string(os.PathSeparator)) {
+			return nil, ErrPoolGuard
+		}
+		paths = append(paths, resolved)
+	}
+	if paths[0] == paths[1] {
+		return nil, ErrPoolGuard
+	}
+	record, err := guard.grants()
+	if err != nil {
+		return nil, err
+	}
+	if err := guard.acceptCheckpoint(record); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func (m *Manager) poolGrant(auth *Auth, model string, capabilities []string) (*PoolGrant, error) {
@@ -159,24 +206,7 @@ func (m *Manager) poolGrant(auth *Auth, model string, capabilities []string) (*P
 	if guard.role != "service" || auth == nil || auth.AuthKind() != AuthKindOAuth || auth.Disabled || auth.Status == StatusDisabled || auth.Unavailable {
 		return nil, ErrPoolGuard
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil || cfg.AuthDir == "" {
-		return nil, ErrPoolGuard
-	}
-	authRoot, err := filepath.Abs(cfg.AuthDir)
-	if err != nil {
-		return nil, ErrPoolGuard
-	}
-	grantPath, err := filepath.Abs(guard.file)
-	if err != nil {
-		return nil, ErrPoolGuard
-	}
-	root, err := filepath.EvalSymlinks(authRoot)
-	file, fileErr := filepath.EvalSymlinks(grantPath)
-	if err != nil || fileErr != nil || file == root || strings.HasPrefix(file, root+string(os.PathSeparator)) {
-		return nil, ErrPoolGuard
-	}
-	record, err := guard.grants()
+	record, err := m.poolGrants()
 	if err != nil {
 		return nil, err
 	}
