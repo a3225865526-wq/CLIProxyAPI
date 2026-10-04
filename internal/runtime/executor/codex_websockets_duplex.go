@@ -585,6 +585,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					reporter.EnsurePublished(ctx)
 				}
 			}
+			payload = helps.AnnotateCodexMetering(payload, reporter)
 			if !send(cliproxyexecutor.StreamChunk{Payload: helps.EnsureResponsesUsageDetails(payload)}) {
 				return
 			}

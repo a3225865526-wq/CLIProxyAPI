@@ -136,6 +136,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		requestDetail:       detail,
 		AccountingVersion:   coreusage.TokenAccountingSchemaVersion,
 		TokenBreakdown:      usageDetail.TokenBreakdown,
+		CodexMetering:       usageDetail.CodexMetering,
 		Provider:            provider,
 		ExecutorType:        executorType,
 		Model:               modelName,
@@ -166,6 +167,7 @@ type queuedUsageDetail struct {
 	requestDetail
 	AccountingVersion   int                      `json:"accounting_version"`
 	TokenBreakdown      coreusage.TokenBreakdown `json:"token_breakdown"`
+	CodexMetering       *coreusage.CodexMetering `json:"codex_metering,omitempty"`
 	Provider            string                   `json:"provider"`
 	ExecutorType        string                   `json:"executor_type"`
 	Model               string                   `json:"model"`

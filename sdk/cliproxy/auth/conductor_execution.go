@@ -597,6 +597,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			startExec := time.Now()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
+			if provider == "codex" && errExec != nil && cliproxyexecutor.UpstreamAttempted(execCtx) {
+				return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
+			}
 			durationExec := time.Since(startExec)
 			if errExec != nil {
 				if hasUpstreamExecutionAttempt(errExec) {

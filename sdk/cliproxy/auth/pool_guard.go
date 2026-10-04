@@ -18,6 +18,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 const PoolGuardVersion = 3
@@ -382,7 +383,7 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	child, cancel := context.WithCancelCause(ctx)
 	guard.nextLease++
 	lease := &poolLease{PoolInFlight: PoolInFlight{RequestID: guard.nextLease, AuthID: auth.ID, Provider: auth.Provider, ExecutorID: guard.executorID, CredentialDigest: PoolCredentialDigest(auth), AuthorizationVersion: trust.AuthorizationVersion, Generation: trust.Generation}, manager: executor.manager, auth: auth.Clone(), req: req, caps: caps, ctx: child, cancel: cancel, consumeAttempt: consumeAttempt}
-	lease.ctx = cliproxyexecutor.WithDispatchGuard(child, lease)
+	lease.ctx = usage.WithCodexMeteringObserver(cliproxyexecutor.WithDispatchGuard(child, lease), lease.observeMetering)
 	lease.stopClose = context.AfterFunc(child, lease.closeResource)
 	if guard.leases == nil {
 		guard.leases = make(map[uint64]*poolLease)
@@ -395,13 +396,13 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	lease, err := executor.begin(ctx, auth, req, false, true)
 	if err != nil {
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, poolAccountingTermination(err, nil)
 	}
 	defer lease.End("completed")
 	opts.ExecutionLifecycle = lease
 	response, err := executor.ProviderExecutor.Execute(lease.ctx, auth, req, opts)
 	if cause := context.Cause(lease.ctx); cause != nil {
-		return cliproxyexecutor.Response{}, cause
+		return cliproxyexecutor.Response{}, poolAccountingTermination(cause, lease)
 	}
 	return response, err
 }
@@ -409,7 +410,7 @@ func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req clipr
 func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, resultErr error) {
 	lease, err := executor.begin(ctx, auth, req, true, true)
 	if err != nil {
-		return nil, err
+		return nil, poolAccountingTermination(err, nil)
 	}
 	handedOff := false
 	defer func() {
@@ -420,7 +421,7 @@ func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req
 	opts.ExecutionLifecycle = lease
 	result, err = executor.ProviderExecutor.ExecuteStream(lease.ctx, auth, req, opts)
 	if cause := context.Cause(lease.ctx); cause != nil {
-		return nil, cause
+		return nil, poolAccountingTermination(cause, lease)
 	}
 	if err != nil || result == nil || result.Chunks == nil {
 		return result, err
@@ -437,7 +438,7 @@ func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req
 			default:
 			}
 			if cause := context.Cause(lease.ctx); cause != nil && cause != context.Canceled {
-				chunks <- cliproxyexecutor.StreamChunk{Err: cause}
+				chunks <- cliproxyexecutor.StreamChunk{Err: poolAccountingTermination(cause, lease)}
 			}
 		}
 		for {
@@ -479,12 +480,12 @@ func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req
 func (executor *poolExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	lease, err := executor.begin(ctx, auth, req, false, true)
 	if err != nil {
-		return cliproxyexecutor.Response{}, err
+		return cliproxyexecutor.Response{}, poolAccountingTermination(err, nil)
 	}
 	defer lease.End("count_end")
 	response, err := executor.ProviderExecutor.CountTokens(lease.ctx, auth, req, opts)
 	if cause := context.Cause(lease.ctx); cause != nil {
-		return cliproxyexecutor.Response{}, cause
+		return cliproxyexecutor.Response{}, poolAccountingTermination(cause, lease)
 	}
 	return response, err
 }

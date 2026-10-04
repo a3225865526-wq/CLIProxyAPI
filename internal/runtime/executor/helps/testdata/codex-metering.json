@@ -1,0 +1,273 @@
+[
+  {
+    "name": "responses-cache-reasoning",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "exact",
+    "reason": "",
+    "derived": false
+  },
+  {
+    "name": "chat-cache-reasoning",
+    "usage": {
+      "prompt_tokens": 100,
+      "completion_tokens": 20,
+      "total_tokens": 120,
+      "prompt_tokens_details": {
+        "cached_tokens": 30
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "exact",
+    "reason": "",
+    "derived": false
+  },
+  {
+    "name": "zero-output",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 0,
+      "total_tokens": 100,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "status": "exact",
+    "reason": "",
+    "derived": false
+  },
+  {
+    "name": "exact-zero",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0,
+      "input_tokens_details": {
+        "cached_tokens": 0
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "status": "exact",
+    "reason": "",
+    "derived": false
+  },
+  {
+    "name": "derived-total",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "exact",
+    "reason": "",
+    "derived": true
+  },
+  {
+    "name": "high-tokens",
+    "usage": {
+      "input_tokens": 999999999999,
+      "output_tokens": 1,
+      "total_tokens": 1000000000000,
+      "input_tokens_details": {
+        "cached_tokens": 800000000000
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 1
+      }
+    },
+    "status": "exact",
+    "reason": "",
+    "derived": false
+  },
+  {
+    "name": "missing",
+    "usage": null,
+    "status": "unavailable",
+    "reason": "missing_usage",
+    "derived": false
+  },
+  {
+    "name": "partial",
+    "usage": {
+      "input_tokens": 100
+    },
+    "status": "unavailable",
+    "reason": "partial_usage",
+    "derived": false
+  },
+  {
+    "name": "inconsistent-total",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "total_tokens": 121,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "inconsistent_total",
+    "derived": false
+  },
+  {
+    "name": "cache-exceeds-input",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 101
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "inconsistent_details",
+    "derived": false
+  },
+  {
+    "name": "reasoning-exceeds-output",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 21
+      }
+    },
+    "status": "unavailable",
+    "reason": "inconsistent_details",
+    "derived": false
+  },
+  {
+    "name": "negative",
+    "usage": {
+      "input_tokens": -1,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "malformed_usage",
+    "derived": false
+  },
+  {
+    "name": "fraction",
+    "usage": {
+      "input_tokens": 1.5,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "malformed_usage",
+    "derived": false
+  },
+  {
+    "name": "string",
+    "usage": {
+      "input_tokens": "100",
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "malformed_usage",
+    "derived": false
+  },
+  {
+    "name": "overflow",
+    "usage": {
+      "input_tokens": 9223372036854775808,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "malformed_usage",
+    "derived": false
+  },
+  {
+    "name": "null",
+    "usage": {
+      "input_tokens": null,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      }
+    },
+    "status": "unavailable",
+    "reason": "malformed_usage",
+    "derived": false
+  },
+  {
+    "name": "alias-conflict",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "total_tokens": 120,
+      "input_tokens_details": {
+        "cached_tokens": 30
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 7
+      },
+      "prompt_tokens": 99
+    },
+    "status": "unavailable",
+    "reason": "malformed_usage",
+    "derived": false
+  }
+]

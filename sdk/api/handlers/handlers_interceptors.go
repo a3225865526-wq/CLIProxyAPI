@@ -288,7 +288,11 @@ func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
 
 func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.Header {
 	if !passthrough {
-		return nil
+		result := make(http.Header)
+		if headers.Get("X-Codex-Metering") == "v1" {
+			result.Set("X-Codex-Metering", "v1")
+		}
+		return result
 	}
 	return FilterUpstreamHeaders(headers)
 }
@@ -297,7 +301,14 @@ func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrou
 	if passthrough {
 		return FilterUpstreamHeaders(finalRaw)
 	}
-	return FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	result := FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	if baseRaw.Get("X-Codex-Metering") == "v1" {
+		if result == nil {
+			result = make(http.Header)
+		}
+		result.Set("X-Codex-Metering", "v1")
+	}
+	return result
 }
 
 func diffHeaders(base, next http.Header) http.Header {

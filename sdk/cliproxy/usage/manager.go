@@ -77,6 +77,7 @@ type Failure struct {
 
 // Detail holds the token usage breakdown.
 type Detail struct {
+	CodexMetering       *CodexMetering
 	InputTokens         int64
 	OutputTokens        int64
 	ReasoningTokens     int64

@@ -242,6 +242,10 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			startHomeExec := time.Now()
 			response, errExecute = execute()
 			errExecute = markUpstreamExecutionAttemptFromContext(execCtx, errExecute)
+			if !countTokens && selection.Provider == "codex" && errExecute != nil && cliproxyexecutor.UpstreamAttempted(execCtx) {
+				releaseAttempt()
+				return cliproxyexecutor.Response{}, wrapRequestStopError(errExecute)
+			}
 			durationHomeExec := time.Since(startHomeExec)
 			if countTokens {
 				if _, fingerprint := getEffectiveAuth(); isUnauthorizedError(errExecute) {

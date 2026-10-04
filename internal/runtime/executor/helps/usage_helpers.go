@@ -3,6 +3,7 @@ package helps
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -520,6 +521,9 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if model == "" {
 		return usage.Record{}, false
 	}
+	if r.provider == "codex" && detail.CodexMetering == nil {
+		detail.CodexMetering = usage.ParseCodexMetering(nil)
+	}
 	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
@@ -552,6 +556,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	r.once.Do(func() {
+		usage.ObserveCodexMetering(ctx, detail.CodexMetering)
 		r.publishAttemptRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
@@ -580,7 +585,11 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		r.publishAttemptRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
+		detail := usage.Detail{}
+		if r.provider == "codex" {
+			detail.CodexMetering = usage.ParseCodexMetering(nil)
+		}
+		r.publishAttemptRecord(ctx, r.buildRecord(detail, false, usage.Failure{}))
 	})
 }
 
@@ -968,17 +977,31 @@ func (b *StreamUsageBuffer) ResponseModel() string {
 }
 
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
-	responseServiceTier := extractResponseServiceTier(data)
-	usageNode := gjson.ParseBytes(data).Get("response.usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		if responseServiceTier == "" {
-			return usage.Detail{}, false
-		}
-		return usage.Detail{ResponseServiceTier: responseServiceTier}, true
+	m := usage.ParseCodexMetering([]byte(gjson.GetBytes(data, "response.usage").Raw))
+	if envelope := gjson.GetBytes(data, "response.usage.codex_metering"); envelope.Exists() {
+		_ = json.Unmarshal([]byte(envelope.Raw), m)
 	}
-	detail := parseOpenAIStyleUsageNode(usageNode)
-	detail.ResponseServiceTier = responseServiceTier
-	return detail, true
+	kind := gjson.GetBytes(data, "type").String()
+	m.Final = kind == "response.completed" || kind == "response.done" || kind == "response.incomplete"
+	d := parseOpenAIStyleUsageNode(gjson.GetBytes(data, "response.usage"))
+	d.CodexMetering, d.ResponseServiceTier = m, extractResponseServiceTier(data)
+	if m.Input != nil {
+		d.InputTokens = *m.Input
+	}
+	if m.Output != nil {
+		d.OutputTokens = *m.Output
+	}
+	if m.Cached != nil {
+		d.CachedTokens, d.CacheReadTokens = *m.Cached, *m.Cached
+	}
+	if m.Reasoning != nil {
+		d.ReasoningTokens = *m.Reasoning
+	}
+	if m.Total != nil {
+		d.TotalTokens = *m.Total
+	}
+	d.TokenBreakdown = usage.NewSubsetTokenBreakdown(d.InputTokens, d.CacheReadTokens, d.CacheCreationTokens, d.OutputTokens, d.ReasoningTokens, d.TotalTokens)
+	return d, true
 }
 
 func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {

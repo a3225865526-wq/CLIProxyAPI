@@ -2,10 +2,13 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 type accountRevokedError struct{}
@@ -21,6 +24,47 @@ func (accountRevokedError) ResponseBody() []byte {
 }
 
 var ErrAccountRevoked = accountRevokedError{}
+
+// poolAccountingError carries only dispatch evidence, never credentials.
+// The original security error remains discoverable with errors.Is/As.
+type poolAccountingError struct {
+	cause      error
+	dispatched bool
+	meter      *usage.CodexMetering
+}
+
+func (e poolAccountingError) Error() string         { return e.cause.Error() }
+func (e poolAccountingError) Unwrap() error         { return e.cause }
+func (e poolAccountingError) DirectResponse() bool  { return true }
+func (e poolAccountingError) IsRequestStop() bool   { return true }
+func (e poolAccountingError) IsRequestScoped() bool { return true }
+func (e poolAccountingError) StatusCode() int       { return http.StatusForbidden }
+func (e poolAccountingError) ResponseBody() []byte {
+	code := "pool_admission_required"
+	if errors.Is(e.cause, ErrAccountRevoked) {
+		code = "account_revoked"
+	}
+	data, _ := json.Marshal(map[string]any{"error": map[string]any{"message": code, "type": "security_error", "code": code, "metadata": map[string]any{"codex_upstream_dispatched": e.dispatched, "codex_metering": e.meter}}})
+	return data
+}
+func poolAccountingTermination(err error, lease *poolLease) error {
+	if !errors.Is(err, ErrAccountRevoked) && !errors.Is(err, ErrPoolGuard) {
+		return err
+	}
+	dispatched := false
+	if lease != nil {
+		lease.manager.poolGuard.mu.RLock()
+		dispatched = lease.Dispatched
+		lease.manager.poolGuard.mu.RUnlock()
+	}
+	var meter *usage.CodexMetering
+	if lease != nil {
+		lease.meterMu.Lock()
+		meter = lease.meter
+		lease.meterMu.Unlock()
+	}
+	return poolAccountingError{cause: err, dispatched: dispatched, meter: meter}
+}
 
 // PoolInFlight contains no credentials or request bodies. RequestID is a local
 // monotonically assigned ID; channel identity remains owned by the website.
@@ -51,6 +95,16 @@ type poolLease struct {
 	consumeAttempt    bool
 	connectAuthorized bool
 	payloadAuthorized bool
+	meterMu           sync.Mutex
+	meter             *usage.CodexMetering
+}
+
+func (lease *poolLease) observeMetering(m *usage.CodexMetering) {
+	lease.meterMu.Lock()
+	defer lease.meterMu.Unlock()
+	if lease.meter == nil {
+		lease.meter = m
+	}
 }
 
 func (guard *poolGuard) cancelPoolLeases(reason error) {
