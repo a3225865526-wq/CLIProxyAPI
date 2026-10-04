@@ -946,6 +946,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	if h.authManager != nil && h.authManager.PoolRole() == "service" {
+		return "", coreauth.ErrPoolGuard
+	}
 	h.mergeExistingAuthFileMetadata(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
@@ -962,6 +965,13 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
+	}
+	if h.authManager != nil && h.authManager.PoolRole() != "" {
+		record.Disabled, record.Status = true, coreauth.StatusDisabled
+		if record.Metadata == nil {
+			record.Metadata = make(map[string]any)
+		}
+		record.Metadata["disabled"] = true
 	}
 	savedPath, errSave := store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if errSave != nil {

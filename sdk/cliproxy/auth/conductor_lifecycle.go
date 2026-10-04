@@ -35,6 +35,9 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if executor == nil {
 		return
 	}
+	if m.poolGuard != nil {
+		executor = &poolExecutor{ProviderExecutor: executor, manager: m}
+	}
 	provider := strings.TrimSpace(executor.Identifier())
 	if provider == "" {
 		return
@@ -80,12 +83,27 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	if m.poolGuard != nil {
+		m.poolGuard.mu.Lock()
+		defer m.poolGuard.mu.Unlock()
+	}
 	NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("register auth: %w", errWeight)
 	}
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
+	}
+	if m.poolGuard != nil {
+		if m.poolGuard.role != "service" {
+			quarantinePoolAuth(auth)
+		} else {
+			// A newly appearing file never enrolls itself. Only a separate grant
+			// can permit a matching credential; disabled imports stay disabled.
+			if _, err := m.poolGrant(auth, firstPoolGrantModel(m, auth), nil); err != nil {
+				quarantinePoolAuth(auth)
+			}
+		}
 	}
 	now := time.Now()
 	if auth.Generation == 0 {
@@ -161,6 +179,10 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	if m.poolGuard != nil {
+		m.poolGuard.mu.Lock()
+		defer m.poolGuard.mu.Unlock()
+	}
 	NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("update auth: %w", errWeight)
@@ -192,6 +214,14 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		if merged != nil {
 			auth = merged
 			NormalizeCredentialMetadata(auth.Metadata)
+		}
+	}
+	if m.poolGuard != nil {
+		if (mode == updateModeRefresh || mode == updateModePrepare) && existing.Disabled {
+			quarantinePoolAuth(auth)
+		}
+		if _, err := m.poolGrant(auth, firstPoolGrantModel(m, auth), nil); err != nil {
+			quarantinePoolAuth(auth)
 		}
 	}
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {

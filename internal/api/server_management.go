@@ -28,6 +28,7 @@ func (s *Server) registerManagementRoutes() {
 	mgmt := s.engine.Group("/v0/management")
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
+		mgmt.GET("/pool/isolation", s.mgmt.GetPoolIsolation)
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
@@ -205,6 +206,17 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !s.managementAvailable(c) {
 			return
+		}
+		if s.handlers != nil && s.handlers.AuthManager != nil {
+			role := s.handlers.AuthManager.PoolRole()
+			if role != "" && role != "staging" {
+				path, method := c.Request.URL.Path, c.Request.Method
+				allowed := role == "service" && ((method == http.MethodGet && (path == "/v0/management/auth-files" || path == "/v0/management/pool/isolation")) || (method == http.MethodPatch && path == "/v0/management/auth-files/status") || (method == http.MethodDelete && path == "/v0/management/auth-files"))
+				if !allowed {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "pool_service_management_restricted"})
+					return
+				}
+			}
 		}
 		c.Next()
 	}

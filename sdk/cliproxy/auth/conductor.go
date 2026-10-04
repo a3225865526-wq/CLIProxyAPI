@@ -143,6 +143,7 @@ type resultPolicyHolder struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
+	poolGuard                 *poolGuard
 	store                     Store
 	cooldownStore             CooldownStateStore
 	pendingCooldownStateStore CooldownStateStore
@@ -216,6 +217,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
+		poolGuard:             newPoolGuard(),
 		store:                 store,
 		executors:             make(map[string]ProviderExecutor),
 		selector:              selector,
