@@ -41,4 +41,20 @@ func TestPoolGuardServiceManagementRejectsAuthorizationImportAndProxy(t *testing
 	if response.Code != http.StatusNoContent || calls != 1 {
 		t.Fatal("metadata inspection unexpectedly blocked")
 	}
+	for _, test := range []struct{ method, path string }{
+		{http.MethodGet, "/v0/management/pool/trust"},
+		{http.MethodPost, "/v0/management/pool/trust/promote"},
+		{http.MethodPost, "/v0/management/pool/trust/revoke"},
+	} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(test.method, test.path, nil))
+		if response.Code != http.StatusNoContent {
+			t.Fatal("explicit pool control route blocked", test)
+		}
+	}
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v0/management/pool/trust/promote", nil))
+	if response.Code != http.StatusForbidden {
+		t.Fatal("wrong-method promotion allowed")
+	}
 }

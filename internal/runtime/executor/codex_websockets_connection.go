@@ -35,6 +35,9 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := cliproxyexecutor.BeforeUpstreamConnect(ctx); err != nil {
+		return nil, nil, nil, err
+	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		cliproxyexecutor.MarkUpstreamAttempt(ctx)

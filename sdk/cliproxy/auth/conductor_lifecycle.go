@@ -131,6 +131,10 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.authEpochs[auth.ID]++
 	auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	auth.Generation = 1
+	if err := m.invalidatePoolReplacement(ctx, m.auths[auth.ID], auth); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
@@ -215,6 +219,10 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			auth = merged
 			NormalizeCredentialMetadata(auth.Metadata)
 		}
+	}
+	if err := m.invalidatePoolReplacement(ctx, existing, auth); err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 	if m.poolGuard != nil {
 		if (mode == updateModeRefresh || mode == updateModePrepare) && existing.Disabled {
@@ -320,13 +328,24 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	if id == "" {
 		return
 	}
-	_ = ctx
-
+	if m.poolGuard != nil {
+		m.poolGuard.mu.Lock()
+		defer m.poolGuard.mu.Unlock()
+	}
 	m.mu.Lock()
 	existing := m.auths[id]
 	if existing == nil {
 		m.mu.Unlock()
 		return
+	}
+	if m.poolGuard != nil {
+		incoming := existing.Clone()
+		incoming.Metadata = nil
+		incoming.Attributes = nil
+		if err := m.invalidatePoolReplacement(ctx, existing, incoming); err != nil {
+			m.mu.Unlock()
+			return
+		}
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
@@ -384,6 +403,10 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
+	if m.poolGuard != nil {
+		m.poolGuard.mu.Lock()
+		defer m.poolGuard.mu.Unlock()
+	}
 	m.mu.Lock()
 	if m.store == nil {
 		m.mu.Unlock()
@@ -395,6 +418,24 @@ func (m *Manager) Load(ctx context.Context) error {
 		return err
 	}
 	previousAuths := m.auths
+	if m.poolGuard != nil {
+		incoming := make(map[string]*Auth)
+		for _, item := range items {
+			if item != nil {
+				incoming[item.ID] = item
+			}
+		}
+		for id, existing := range previousAuths {
+			replacement := incoming[id]
+			if replacement == nil {
+				replacement = &Auth{}
+			}
+			if err := m.invalidatePoolReplacement(ctx, existing, replacement); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+		}
+	}
 	m.auths = make(map[string]*Auth, len(items))
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64, len(items))
@@ -406,6 +447,11 @@ func (m *Manager) Load(ctx context.Context) error {
 		NormalizeCredentialMetadata(auth.Metadata)
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
+		}
+		if m.poolGuard != nil {
+			if _, err := m.poolGrant(auth, firstPoolGrantModel(m, auth), nil); err != nil {
+				quarantinePoolAuth(auth)
+			}
 		}
 		auth.EnsureIndex()
 		m.authEpochs[auth.ID] = max(m.authEpochs[auth.ID], auth.RegistrationEpoch) + 1

@@ -152,9 +152,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
+	if errFence := cliproxyexecutor.BeforeUpstreamDispatch(ctx); errFence != nil {
+		unlockStreamSession()
+		return nil, errFence
+	}
 	cliproxyexecutor.MarkUpstreamAttempt(ctx)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
+		if cliproxyexecutor.GuardedDispatch(ctx) {
+			e.invalidateUpstreamConn(sess, conn, "pool_send_error", errSend)
+			unlockStreamSession()
+			return nil, errSend
+		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil && !isEphemeralSession {
 			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {

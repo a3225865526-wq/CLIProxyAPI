@@ -548,7 +548,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
-	if h.AuthManager.HomeEnabled() {
+	if h.AuthManager.HomeEnabled() || h.AuthManager.PoolRole() != "" {
 		maxBootstrapRetries = 0
 	}
 	for bootstrapRetries := 0; !streamCanceledBeforeRead; {

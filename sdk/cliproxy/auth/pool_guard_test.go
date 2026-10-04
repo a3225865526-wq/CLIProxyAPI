@@ -21,15 +21,22 @@ type poolProbeExecutor struct {
 	failure bool
 }
 
-func (*poolProbeExecutor) Identifier() string { return "codex" }
-func (e *poolProbeExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (*poolProbeExecutor) PoolDispatchFencing() bool { return true }
+func (*poolProbeExecutor) Identifier() string        { return "codex" }
+func (e *poolProbeExecutor) Execute(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if err := cliproxyexecutor.BeforeUpstreamDispatch(ctx); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	e.calls.Add(1)
 	if e.failure {
 		return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "synthetic failure"}
 	}
 	return cliproxyexecutor.Response{Payload: []byte(`{"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}`)}, nil
 }
-func (e *poolProbeExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (e *poolProbeExecutor) ExecuteStream(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if err := cliproxyexecutor.BeforeUpstreamDispatch(ctx); err != nil {
+		return nil, err
+	}
 	e.calls.Add(1)
 	return &cliproxyexecutor.StreamResult{Chunks: e.stream}, nil
 }
@@ -69,6 +76,14 @@ func poolGuardFixture(t *testing.T, role string) (*Manager, *poolProbeExecutor, 
 	registered, err := m.Register(context.Background(), auth)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if role == "service" {
+		err := m.PromotePoolIdentities(context.Background(), PoolPromotion{ExpectedRevision: record.Revision, Identities: []PoolIdentityExpectation{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Revision++
+		registered, _ = m.GetByID(auth.ID)
 	}
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}, {ID: "synthetic-other"}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })

@@ -142,6 +142,7 @@ func TestPoolGuardCheckpointNewRevisionAndConcurrentManagers(t *testing.T) {
 	if err != nil || accepted.Revision != record.Revision {
 		t.Fatal("concurrent journal was corrupted")
 	}
+	explicitPoolPromotion(t, m)
 	_, err = m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{})
 	if err != nil || probe.calls.Load() != 1 {
 		t.Fatal("unchanged admitted credential failed")
@@ -169,6 +170,7 @@ func TestPoolGuardCheckpointUnavailablePersistenceNeverCallsUpstream(t *testing.
 	if err == nil || probe.calls.Load() != 0 {
 		t.Fatal("request executed without a durable revision")
 	}
+	explicitPoolPromotion(t, m)
 	_, err = m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{})
 	if err != nil || probe.calls.Load() != 1 {
 		t.Fatal("request did not recover after checkpoint became available")

@@ -149,3 +149,5 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	}
 	return false
 }
+
+func (*CodexAutoExecutor) PoolDispatchFencing() bool { return true }

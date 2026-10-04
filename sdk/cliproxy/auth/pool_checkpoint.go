@@ -13,10 +13,12 @@ import (
 const poolCheckpointLimit = 4 * 1024 * 1024
 
 type poolCheckpoint struct {
-	GuardVersion int    `json:"guard_version"`
-	ExecutorID   string `json:"executor_id"`
-	Revision     uint64 `json:"revision"`
-	Digest       string `json:"digest"`
+	GuardVersion int               `json:"guard_version"`
+	ExecutorID   string            `json:"executor_id"`
+	Revision     uint64            `json:"revision"`
+	Digest       string            `json:"digest"`
+	Trust        []PoolTrustRecord `json:"trust,omitempty"`
+	Integrity    string            `json:"integrity,omitempty"`
 }
 
 func validPoolExecutorID(id string) bool {
@@ -54,31 +56,14 @@ func ProvisionPoolCheckpoint(path, executorID string) error {
 	return nil
 }
 
-// A complete, synced journal entry is required before a new grant is used.
-// Torn writes and missing checkpoints fail closed instead of being repaired.
-func (guard *poolGuard) acceptCheckpoint(record *PoolGrantFile) (resultErr error) {
-	guard.journalMu.Lock()
-	defer guard.journalMu.Unlock()
-	info, err := os.Lstat(guard.checkpoint)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > poolCheckpointLimit {
-		return ErrPoolGuard
+// readPoolCheckpoint validates the entire journal while the caller holds its OS lock.
+func (guard *poolGuard) readPoolCheckpoint(file *os.File) (poolCheckpoint, int, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return poolCheckpoint{}, 0, ErrPoolGuard
 	}
-	file, err := os.OpenFile(guard.checkpoint, os.O_RDWR|os.O_APPEND, 0)
-	if err != nil {
-		return ErrPoolGuard
-	}
-	defer func() {
-		if file.Close() != nil {
-			resultErr = ErrPoolGuard
-		}
-	}()
-	if err := lockPoolCheckpoint(file); err != nil {
-		return ErrPoolGuard
-	}
-	defer unlockPoolCheckpoint(file)
 	data, err := io.ReadAll(io.LimitReader(file, poolCheckpointLimit+1))
 	if err != nil || len(data) > poolCheckpointLimit || len(data) == 0 || data[len(data)-1] != '\n' {
-		return ErrPoolGuard
+		return poolCheckpoint{}, 0, ErrPoolGuard
 	}
 	var floor poolCheckpoint
 	for index, line := range bytes.Split(bytes.TrimSuffix(data, []byte{'\n'}), []byte{'\n'}) {
@@ -86,47 +71,123 @@ func (guard *poolGuard) acceptCheckpoint(record *PoolGrantFile) (resultErr error
 		decoder := json.NewDecoder(bytes.NewReader(line))
 		decoder.DisallowUnknownFields()
 		if decoder.Decode(&item) != nil || item.GuardVersion != PoolGuardVersion || item.ExecutorID != guard.executorID {
-			return ErrPoolGuard
+			return floor, 0, ErrPoolGuard
 		}
 		var extra any
 		if decoder.Decode(&extra) != io.EOF {
-			return ErrPoolGuard
+			return floor, 0, ErrPoolGuard
 		}
 		if index == 0 {
-			if item.Revision != 0 || item.Digest != "" {
-				return ErrPoolGuard
+			if item.Revision != 0 || item.Digest != "" || len(item.Trust) != 0 {
+				return floor, 0, ErrPoolGuard
 			}
 		} else {
 			digest, err := hex.DecodeString(item.Digest)
-			if err != nil || len(digest) != sha256.Size || item.Revision <= floor.Revision {
-				return ErrPoolGuard
+			if err != nil || len(digest) != sha256.Size || item.Revision <= floor.Revision || !validPoolTrust(item) || item.Integrity != poolCheckpointIntegrity(item) {
+				return floor, 0, ErrPoolGuard
 			}
 		}
 		floor = item
 	}
+	if floor.Revision < guard.lastRevision || (floor.Revision == guard.lastRevision && floor.Digest != guard.lastDigest) {
+		return floor, 0, ErrPoolGuard
+	}
+	return floor, len(data), nil
+}
+
+func poolRecordDigest(record *PoolGrantFile) string {
 	body, err := json.Marshal(record)
 	if err != nil {
-		return ErrPoolGuard
+		return ""
 	}
 	sum := sha256.Sum256(body)
-	digest := hex.EncodeToString(sum[:])
-	if floor.Revision < guard.lastRevision || (floor.Revision == guard.lastRevision && floor.Digest != guard.lastDigest) {
+	return hex.EncodeToString(sum[:])
+}
+
+func (guard *poolGuard) openPoolCheckpoint() (*os.File, error) {
+	info, err := os.Lstat(guard.checkpoint)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > poolCheckpointLimit {
+		return nil, ErrPoolGuard
+	}
+	file, err := os.OpenFile(guard.checkpoint, os.O_RDWR|os.O_APPEND, 0)
+	if err != nil {
+		return nil, ErrPoolGuard
+	}
+	if lockPoolCheckpoint(file) != nil {
+		_ = file.Close()
+		return nil, ErrPoolGuard
+	}
+	return file, nil
+}
+
+func (guard *poolGuard) appendPoolCheckpoint(file *os.File, size int, next poolCheckpoint) error {
+	next.Integrity = poolCheckpointIntegrity(next)
+	encoded, err := json.Marshal(next)
+	if err != nil || size+len(encoded)+1 > poolCheckpointLimit {
 		return ErrPoolGuard
 	}
-	if record.Revision < floor.Revision || record.Revision == floor.Revision && digest != floor.Digest {
+	count, err := file.Write(append(encoded, '\n'))
+	if err != nil || count != len(encoded)+1 || file.Sync() != nil {
+		return ErrPoolGuard
+	}
+	return nil
+}
+
+func (guard *poolGuard) installPoolCheckpoint(record poolCheckpoint) {
+	guard.lastRevision, guard.lastDigest = record.Revision, record.Digest
+	guard.trust = make(map[string]PoolTrustRecord, len(record.Trust))
+	for _, trust := range record.Trust {
+		guard.trust[trust.AuthID] = trust
+	}
+}
+
+// Observing a new operator policy advances the 1A floor, but never promotes it.
+// All previous trusted snapshots become pending; revoked tombstones survive.
+func (guard *poolGuard) acceptCheckpoint(record *PoolGrantFile) (resultErr error) {
+	guard.journalMu.Lock()
+	defer guard.journalMu.Unlock()
+	file, err := guard.openPoolCheckpoint()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		unlockPoolCheckpoint(file)
+		if file.Close() != nil {
+			guard.faulted.Store(true)
+			resultErr = ErrPoolGuard
+		}
+	}()
+	floor, size, err := guard.readPoolCheckpoint(file)
+	if err != nil {
+		return err
+	}
+	digest := poolRecordDigest(record)
+	if digest == "" || record.Revision < floor.Revision || record.Revision == floor.Revision && digest != floor.Digest {
 		return ErrPoolGuard
 	}
 	if record.Revision > floor.Revision {
-		next := poolCheckpoint{GuardVersion: PoolGuardVersion, ExecutorID: guard.executorID, Revision: record.Revision, Digest: digest}
-		encoded, err := json.Marshal(next)
-		if err != nil || len(data)+len(encoded)+1 > poolCheckpointLimit {
-			return ErrPoolGuard
-		}
-		count, err := file.Write(append(encoded, '\n'))
-		if err != nil || count != len(encoded)+1 || file.Sync() != nil {
-			return ErrPoolGuard
+		floor = poolCheckpoint{GuardVersion: PoolGuardVersion, ExecutorID: guard.executorID, Revision: record.Revision, Digest: digest, Trust: pendingPoolTrust(floor.Trust, record.Revision)}
+		if err := guard.appendPoolCheckpoint(file, size, floor); err != nil {
+			guard.faulted.Store(true)
+			return err
 		}
 	}
-	guard.lastRevision, guard.lastDigest = record.Revision, digest
+	// Recovered complete records must also be synchronizable before use. A
+	// prior uncertain write is never made usable just because it is readable.
+	if err := file.Sync(); err != nil {
+		guard.faulted.Store(true)
+		return ErrPoolGuard
+	}
+	guard.installPoolCheckpoint(floor)
 	return nil
+}
+
+func poolCheckpointIntegrity(record poolCheckpoint) string {
+	record.Integrity = ""
+	data, err := json.Marshal(record)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

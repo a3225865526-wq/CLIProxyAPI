@@ -6,3 +6,5 @@ import "os"
 
 func lockPoolCheckpoint(*os.File) error { return ErrPoolGuard }
 func unlockPoolCheckpoint(*os.File)     {}
+
+func replacePoolPolicy(string, string) error { return ErrPoolGuard }

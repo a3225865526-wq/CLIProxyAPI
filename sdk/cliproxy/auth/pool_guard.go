@@ -20,7 +20,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-const PoolGuardVersion = 2
+const PoolGuardVersion = 3
 
 type poolAdmissionError struct{}
 
@@ -29,9 +29,15 @@ func (poolAdmissionError) StatusCode() int       { return http.StatusForbidden }
 func (poolAdmissionError) IsRequestScoped() bool { return true }
 func (poolAdmissionError) IsRequestStop() bool   { return true }
 
+func (poolAdmissionError) DirectResponse() bool { return true }
+func (poolAdmissionError) ResponseBody() []byte {
+	return []byte(`{"error":{"message":"pool account admission required","type":"security_error","code":"pool_admission_required"}}`)
+}
+
 var ErrPoolGuard = poolAdmissionError{}
 
 type poolAttemptContextKey struct{}
+type atomicPoolAttempt = atomic.Bool
 
 func (m *Manager) poolExecutionContext(ctx context.Context) (context.Context, error) {
 	if ctx == nil {
@@ -81,6 +87,10 @@ type poolGuard struct {
 	counts       map[string]int
 	lastRevision uint64
 	lastDigest   string
+	trust        map[string]PoolTrustRecord
+	leases       map[uint64]*poolLease
+	nextLease    uint64
+	faulted      atomic.Bool
 }
 
 func newPoolGuard() *poolGuard {
@@ -153,7 +163,7 @@ func (guard *poolGuard) grants() (*PoolGrantFile, error) {
 
 func (m *Manager) poolGrants() (*PoolGrantFile, error) {
 	guard := m.poolGuard
-	if guard == nil || guard.role != "service" || guard.checkpoint == "" {
+	if guard == nil || guard.role != "service" || guard.checkpoint == "" || guard.faulted.Load() {
 		return nil, ErrPoolGuard
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -210,6 +220,13 @@ func (m *Manager) poolGrant(auth *Auth, model string, capabilities []string) (*P
 	if err != nil {
 		return nil, err
 	}
+	if _, ok := guard.trusted(auth, record.Revision); !ok {
+		return nil, ErrPoolGuard
+	}
+	return m.matchPoolGrant(record, auth, model, capabilities)
+}
+
+func (m *Manager) matchPoolGrant(record *PoolGrantFile, auth *Auth, model string, capabilities []string) (*PoolGrant, error) {
 	digest := PoolCredentialDigest(auth)
 	now := time.Now().Unix()
 	var match *PoolGrant
@@ -312,11 +329,25 @@ func (executor *poolExecutor) PrepareRequest(*http.Request, *Auth) error {
 	return ErrPoolGuard
 }
 
-func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, stream bool, consumeAttempt bool) (func(), error) {
+func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, stream bool, consumeAttempt bool) (*poolLease, error) {
 	guard := executor.manager.poolGuard
-	guard.mu.RLock()
-	if auth == nil {
-		guard.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if consumeAttempt {
+		budget, _ := ctx.Value(poolAttemptContextKey{}).(*atomicPoolAttempt)
+		if budget == nil || budget.Load() {
+			return nil, ErrPoolGuard
+		}
+	}
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if auth == nil || auth.Provider != "codex" {
+		return nil, ErrPoolGuard
+	}
+	// Unsupported executors cannot claim a dispatch fence merely by registration.
+	fenced, ok := executor.ProviderExecutor.(interface{ PoolDispatchFencing() bool })
+	if !ok || !fenced.PoolDispatchFencing() {
 		return nil, ErrPoolGuard
 	}
 	executor.manager.mu.RLock()
@@ -324,99 +355,147 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	currentMatches := current != nil && !current.Disabled && current.Status != StatusDisabled && PoolCredentialDigest(current) == PoolCredentialDigest(auth)
 	executor.manager.mu.RUnlock()
 	if !currentMatches {
-		guard.mu.RUnlock()
 		return nil, ErrPoolGuard
 	}
 	caps, err := poolRequestCapabilities(req, stream)
 	if err != nil {
-		guard.mu.RUnlock()
 		return nil, err
 	}
 	grant, err := executor.manager.poolGrant(auth, req.Model, caps)
 	if err != nil {
-		guard.mu.RUnlock()
 		return nil, err
 	}
-	if consumeAttempt {
-		budget, _ := ctx.Value(poolAttemptContextKey{}).(*atomic.Bool)
-		if budget == nil || !budget.CompareAndSwap(false, true) {
-			guard.mu.RUnlock()
-			return nil, ErrPoolGuard
-		}
-	}
+	guard.journalMu.Lock()
+	trust := guard.trust[auth.ID]
+	guard.journalMu.Unlock()
 	guard.countsMu.Lock()
+	defer guard.countsMu.Unlock()
 	if guard.counts[auth.ID] >= grant.MaxConcurrency {
-		guard.countsMu.Unlock()
-		guard.mu.RUnlock()
 		return nil, ErrPoolGuard
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, cause
+	}
+	child, cancel := context.WithCancelCause(ctx)
+	guard.nextLease++
+	lease := &poolLease{PoolInFlight: PoolInFlight{RequestID: guard.nextLease, AuthID: auth.ID, Provider: auth.Provider, ExecutorID: guard.executorID, CredentialDigest: PoolCredentialDigest(auth), AuthorizationVersion: trust.AuthorizationVersion, Generation: trust.Generation}, manager: executor.manager, auth: auth.Clone(), req: req, caps: caps, ctx: child, cancel: cancel, consumeAttempt: consumeAttempt}
+	lease.ctx = cliproxyexecutor.WithDispatchGuard(child, lease)
+	lease.stopClose = context.AfterFunc(child, lease.closeResource)
+	if guard.leases == nil {
+		guard.leases = make(map[uint64]*poolLease)
+	}
+	guard.leases[lease.RequestID] = lease
 	guard.counts[auth.ID]++
-	guard.countsMu.Unlock()
-	return func() { guard.countsMu.Lock(); guard.counts[auth.ID]--; guard.countsMu.Unlock(); guard.mu.RUnlock() }, nil
+	return lease, nil
 }
 
 func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	release, err := executor.begin(ctx, auth, req, false, true)
+	lease, err := executor.begin(ctx, auth, req, false, true)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	defer release()
-	return executor.ProviderExecutor.Execute(ctx, auth, req, opts)
+	defer lease.End("completed")
+	opts.ExecutionLifecycle = lease
+	response, err := executor.ProviderExecutor.Execute(lease.ctx, auth, req, opts)
+	if cause := context.Cause(lease.ctx); cause != nil {
+		return cliproxyexecutor.Response{}, cause
+	}
+	return response, err
 }
 
-func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	release, err := executor.begin(ctx, auth, req, true, true)
+func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, resultErr error) {
+	lease, err := executor.begin(ctx, auth, req, true, true)
 	if err != nil {
 		return nil, err
 	}
-	result, err := executor.ProviderExecutor.ExecuteStream(ctx, auth, req, opts)
-	if err != nil || result == nil {
-		release()
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			lease.End("bootstrap_end")
+		}
+	}()
+	opts.ExecutionLifecycle = lease
+	result, err = executor.ProviderExecutor.ExecuteStream(lease.ctx, auth, req, opts)
+	if cause := context.Cause(lease.ctx); cause != nil {
+		return nil, cause
+	}
+	if err != nil || result == nil || result.Chunks == nil {
 		return result, err
 	}
-	chunks := make(chan cliproxyexecutor.StreamChunk)
+	upstream := result
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
 	go func() {
 		defer close(chunks)
-		defer release()
-		for {
+		defer lease.End("stream_end")
+		terminate := func() {
+			// Discard an undelivered buffered payload, preserving the explicit terminal.
 			select {
-			case <-ctx.Done():
+			case <-chunks:
+			default:
+			}
+			if cause := context.Cause(lease.ctx); cause != nil && cause != context.Canceled {
+				chunks <- cliproxyexecutor.StreamChunk{Err: cause}
+			}
+		}
+		for {
+			if lease.ctx.Err() != nil {
+				terminate()
 				return
-			case chunk, ok := <-result.Chunks:
+			}
+			select {
+			case <-lease.ctx.Done():
+				terminate()
+				return
+			case chunk, ok := <-upstream.Chunks:
 				if !ok {
+					if lease.ctx.Err() != nil {
+						terminate()
+					}
+					return
+				}
+				if lease.ctx.Err() != nil {
+					terminate()
 					return
 				}
 				select {
 				case chunks <- chunk:
-				case <-ctx.Done():
+					if chunk.Err != nil {
+						return
+					}
+				case <-lease.ctx.Done():
+					terminate()
 					return
 				}
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: chunks}, nil
+	handedOff = true
+	return &cliproxyexecutor.StreamResult{Headers: upstream.Headers, Chunks: chunks}, nil
 }
 
 func (executor *poolExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	release, err := executor.begin(ctx, auth, req, false, true)
+	lease, err := executor.begin(ctx, auth, req, false, true)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	defer release()
-	return executor.ProviderExecutor.CountTokens(ctx, auth, req, opts)
+	defer lease.End("count_end")
+	response, err := executor.ProviderExecutor.CountTokens(lease.ctx, auth, req, opts)
+	if cause := context.Cause(lease.ctx); cause != nil {
+		return cliproxyexecutor.Response{}, cause
+	}
+	return response, err
 }
 
 func (executor *poolExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, ErrPoolGuard
 }
 
-func (executor *poolExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
-	release, err := executor.begin(ctx, auth, cliproxyexecutor.Request{Model: firstPoolGrantModel(executor.manager, auth)}, false, false)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	return executor.ProviderExecutor.Refresh(ctx, auth)
+// Service refresh cannot mint a new identity outside explicit staging/promotion.
+func (executor *poolExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
+	return nil, ErrPoolGuard
 }
 
 func quarantinePoolAuth(auth *Auth) {
