@@ -333,6 +333,28 @@ func TestPoolStage3ModelMatching(t *testing.T) {
 			t.Fatal("uppercase capability executed without a floor entry")
 		}
 	})
+	t.Run("alias-grant-does-not-admit-canonical", func(t *testing.T) {
+		m, _, _, file, record := poolGuardFixture(t, "service")
+		probe := &poolStage3Probe{complete: make(chan struct{})}
+		close(probe.complete)
+		m.RegisterExecutor(probe)
+		// The operator floor and the capability ledger both admit the alias name
+		// only. Selection eligibility must follow the account-resolved canonical
+		// model, so the alias grant alone must not make the account eligible.
+		poolStage3AddAccount(t, m, file, &record, "synthetic-aliased", []string{"alias-native"}, func(auth *Auth) {
+			SetOAuthModelAliasesAttribute(auth, []internalconfig.OAuthModelAlias{{Name: "synthetic-native", Alias: "alias-native"}})
+		})
+		aliased, ok := m.GetByID("synthetic-aliased")
+		if !ok {
+			t.Fatal("aliased account vanished")
+		}
+		if err := grantPoolModelCapability(t, m, aliased, "alias-native"); err != nil {
+			t.Fatal(err)
+		}
+		if err := poolRequestModel(m, "alias-native"); err == nil || probe.calls.Load() != 0 {
+			t.Fatal("alias-only grant executed on the unadmitted canonical model")
+		}
+	})
 	t.Run("unknown-alias-fail-closed", func(t *testing.T) {
 		m, _, _, file, record := poolGuardFixture(t, "service")
 		probe := &poolStage3Probe{complete: make(chan struct{})}

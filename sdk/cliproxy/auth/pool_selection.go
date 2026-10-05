@@ -27,10 +27,12 @@ func requestedModelFromOptions(opts cliproxyexecutor.Options) string {
 	return requested
 }
 
-// poolCandidateAllowed filters pool accounts during selection. The check runs on
-// the requested model and, if that differs, on the account-resolved canonical
-// model, so an alias can never select an account whose canonical model is not
-// admitted. Execution-time begin and the dispatch fence re-check the final model.
+// poolCandidateAllowed filters pool accounts during selection. Eligibility is
+// decided solely on the account-resolved canonical model — the model the
+// executor would actually dispatch — so a grant on the requested alias alone
+// never admits a candidate. The requested name is observability and
+// prefiltering input only. Execution-time begin and the dispatch fence re-check
+// the final upstream model.
 func (manager *Manager) poolCandidateAllowed(auth *Auth, model string, opts cliproxyexecutor.Options) bool {
 	if manager.poolGuard == nil {
 		return true
@@ -43,12 +45,9 @@ func (manager *Manager) poolCandidateAllowed(auth *Auth, model string, opts clip
 	if err != nil {
 		return false
 	}
-	if err := manager.poolModelCheck(record, auth, model, caps); err == nil {
-		return true
-	}
 	resolved := manager.selectionModelForAuth(auth, model)
-	if resolved == "" || resolved == model {
-		return false
+	if resolved == "" {
+		resolved = model
 	}
 	return manager.poolModelCheck(record, auth, resolved, caps) == nil
 }
