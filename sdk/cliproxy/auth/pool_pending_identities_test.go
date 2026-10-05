@@ -33,7 +33,7 @@ func TestPoolPendingIdentitiesExposeBootstrapDigests(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(&internalconfig.Config{AuthDir: dir})
 
-	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused"}}
+	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused", "account_id": "synthetic-account-id"}}
 	if _, err := m.Register(context.Background(), auth); err != nil {
 		t.Fatal(err)
 	}

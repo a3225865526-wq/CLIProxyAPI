@@ -85,7 +85,7 @@ func poolStage3Identity(t *testing.T, m *Manager, auth *Auth) (uint64, PoolIdent
 // so both identities are promoted in one batch.
 func poolStage3AddAccount(t *testing.T, m *Manager, file string, record *PoolGrantFile, id string, models []string, prepare func(*Auth)) *Auth {
 	t.Helper()
-	auth := &Auth{ID: id, Provider: "codex", FileName: id + ".json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-" + id}}
+	auth := &Auth{ID: id, Provider: "codex", FileName: id + ".json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-" + id, "account_id": "synthetic-account-" + id}}
 	if prepare != nil {
 		prepare(auth)
 	}
@@ -688,7 +688,7 @@ func TestPoolStage3DispatchRace(t *testing.T) {
 		m, probe, auth, _, _ := poolGuardFixture(t, "service")
 		revision, identity := poolStage3Identity(t, m, auth)
 		replacement := auth.Clone()
-		replacement.Metadata["access_token"] = "synthetic-replaced"
+		replacement.Metadata["account_id"] = "synthetic-account-id-replaced"
 		start := make(chan struct{})
 		var group sync.WaitGroup
 		group.Go(func() {
@@ -750,7 +750,7 @@ func TestPoolStage3RestartAndCorruption(t *testing.T) {
 	t.Run("identity-mismatch-invalidates", func(t *testing.T) {
 		m, probe, auth, _, _ := poolGuardFixture(t, "service")
 		changed := auth.Clone()
-		changed.Metadata["access_token"] = "synthetic-other-credential"
+		changed.Metadata["account_id"] = "synthetic-account-id-other"
 		if _, err := m.Update(context.Background(), changed); err != nil {
 			t.Fatal(err)
 		}

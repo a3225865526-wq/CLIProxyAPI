@@ -35,7 +35,7 @@ func TestPoolStage3ManagementAPI(t *testing.T) {
 	cfg := &config.Config{AuthDir: dir}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.SetConfig(cfg)
-	auth := &coreauth.Auth{ID: "synthetic", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{coreauth.AttributeAuthKind: coreauth.AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused"}}
+	auth := &coreauth.Auth{ID: "synthetic", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{coreauth.AttributeAuthKind: coreauth.AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused", "account_id": "synthetic-account-id"}}
 	identity := coreauth.PoolIdentityExpectation{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: coreauth.PoolCredentialDigest(auth)}
 	record := coreauth.PoolGrantFile{GuardVersion: coreauth.PoolGuardVersion, ExecutorID: "synthetic-executor", Revision: 1, Grants: []coreauth.PoolGrant{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: identity.CredentialDigest, Models: []string{"synthetic-native"}, Capabilities: []string{"text_chat", "exact_usage"}, Enabled: true, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(), MaxConcurrency: 1, SourceEvidence: []string{"synthetic"}, TestEvidence: []string{"synthetic"}}}}
 	data, _ := json.Marshal(record)

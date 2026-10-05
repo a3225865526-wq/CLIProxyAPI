@@ -69,7 +69,7 @@ func poolGuardFixture(t *testing.T, role string) (*Manager, *poolProbeExecutor, 
 	m.SetConfig(&internalconfig.Config{AuthDir: dir})
 	executor := &poolProbeExecutor{stream: make(chan cliproxyexecutor.StreamChunk)}
 	m.RegisterExecutor(executor)
-	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused"}}
+	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused", "account_id": "synthetic-account-id", "email": "synthetic-pool-account@staging.invalid"}}
 	record := PoolGrantFile{GuardVersion: PoolGuardVersion, Revision: 1, Grants: []PoolGrant{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth), Models: []string{"synthetic-native"}, Capabilities: []string{"text_chat", "stream_text", "exact_usage"}, Enabled: true, MaxConcurrency: 1, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(), SourceEvidence: []string{"synthetic-source"}, TestEvidence: []string{"synthetic-test"}}}}
 	record.ExecutorID = "synthetic-executor"
 	writePoolGrant(t, file, record)
@@ -254,11 +254,25 @@ func TestPoolGuardRefreshPauseAndRestartPreserveQuarantine(t *testing.T) {
 	if err == nil || executor.calls.Load() != 0 {
 		t.Fatal("paused auth executed")
 	}
-	// Credential changes require a new trusted promotion, not a metadata claim.
+	// A normal access-token rotation must not churn trust: the canonical
+	// identity is stable (PG-29 v2), so the existing promotion keeps admitting.
+	rotated := updated.Clone()
+	rotated.Disabled = false
+	rotated.Status = StatusActive
+	rotated.Metadata["access_token"] = "synthetic-rotated"
+	rotated, err = m.Update(context.Background(), rotated)
+	if err != nil || rotated.Disabled {
+		t.Fatal("normal token rotation churned trust")
+	}
+	if err := poolRequest(m); err != nil || executor.calls.Load() != 1 {
+		t.Fatal("token rotation broke trusted admission", err)
+	}
+	// Replacing the stable account identity is a credential replacement. It can
+	// never self-admit — not with the same auth ID, file name, or metadata claim.
 	changed := updated.Clone()
 	changed.Disabled = false
 	changed.Status = StatusActive
-	changed.Metadata["access_token"] = "synthetic-rotated"
+	changed.Metadata["account_id"] = "synthetic-account-id-replaced"
 	changed.Metadata["pool_admitted"] = true
 	changed, err = m.Update(context.Background(), changed)
 	if err != nil || !changed.Disabled {
@@ -274,8 +288,9 @@ func TestPoolGuardRefreshPauseAndRestartPreserveQuarantine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	callsBeforeRestart := executor.calls.Load()
 	_, err = restarted.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{})
-	if err == nil || executor.calls.Load() != 0 {
+	if err == nil || executor.calls.Load() != callsBeforeRestart {
 		t.Fatal("restart reopened quarantined auth")
 	}
 }

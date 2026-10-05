@@ -46,7 +46,7 @@ func codexPoolFixture(t *testing.T, baseURL string, ws bool) (*coreauth.Manager,
 	} else {
 		manager.RegisterExecutor(NewCodexExecutor(cfg))
 	}
-	auth := &coreauth.Auth{ID: "synthetic-codex-pool", Provider: "codex", FileName: "synthetic.json", Status: coreauth.StatusActive, Attributes: map[string]string{coreauth.AttributeAuthKind: coreauth.AuthKindOAuth, "base_url": baseURL}, Metadata: map[string]any{"access_token": "synthetic-unused", "websockets": ws}}
+	auth := &coreauth.Auth{ID: "synthetic-codex-pool", Provider: "codex", FileName: "synthetic.json", Status: coreauth.StatusActive, Attributes: map[string]string{coreauth.AttributeAuthKind: coreauth.AuthKindOAuth, "base_url": baseURL}, Metadata: map[string]any{"access_token": "synthetic-unused", "websockets": ws, "account_id": "synthetic-account-id"}}
 	grant := coreauth.PoolGrantFile{GuardVersion: coreauth.PoolGuardVersion, ExecutorID: "synthetic-executor", Revision: 1, Grants: []coreauth.PoolGrant{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: coreauth.PoolCredentialDigest(auth), Models: []string{"synthetic-native"}, Capabilities: []string{"text_chat", "stream_text", "exact_usage"}, Enabled: true, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(), MaxConcurrency: 1, SourceEvidence: []string{"synthetic-source"}, TestEvidence: []string{"synthetic-test"}}}}
 	data, _ := json.Marshal(grant)
 	if err := os.WriteFile(policy, data, 0600); err != nil {

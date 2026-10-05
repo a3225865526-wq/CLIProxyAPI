@@ -65,7 +65,7 @@ func TestPoolStage1BRecoveryChild(t *testing.T) {
 	m.SetConfig(&internalconfig.Config{AuthDir: os.Getenv("POOL_SYNTHETIC_AUTH_DIR")})
 	probe := &poolProbeExecutor{}
 	m.RegisterExecutor(probe)
-	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused"}}
+	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused", "account_id": "synthetic-account-id", "email": "synthetic-pool-account@staging.invalid"}}
 	if _, err := m.Register(context.Background(), auth); err != nil {
 		t.Fatal(err)
 	}
@@ -319,8 +319,11 @@ func TestPoolStage1BRevokePersistenceFailureKeepsCommittedState(t *testing.T) {
 func TestPoolStage1BCredentialReplacementBurnsOldTrust(t *testing.T) {
 	m, probe, auth, _, _ := poolGuardFixture(t, "service")
 	revision, identity := poolExpectation(t, m)
+	// Replacing the stable account identity is a credential replacement even
+	// when the auth ID and file name stay the same; restoring the old identity
+	// bytes afterwards must not revive the burned trust.
 	replacement := auth.Clone()
-	replacement.Metadata["access_token"] = "synthetic-new"
+	replacement.Metadata["account_id"] = "synthetic-account-id-replaced"
 	if _, err := m.Update(context.Background(), replacement); err != nil {
 		t.Fatal(err)
 	}
@@ -348,10 +351,10 @@ func TestPoolStage1BConcurrentPromotionReplacementAndRevoke(t *testing.T) {
 			})
 			group.Go(func() {
 				<-start
-				if scenario == "replace" {
-					auth.Metadata["access_token"] = "synthetic-replaced"
-					_, _ = m.Update(context.Background(), auth)
-				} else {
+					if scenario == "replace" {
+						auth.Metadata["account_id"] = "synthetic-account-id-replaced"
+						_, _ = m.Update(context.Background(), auth)
+					} else {
 					// A stale revoke may lose CAS. A fresh security revoke must then win.
 					_ = m.RevokePoolIdentity(context.Background(), PoolRevocation{ExpectedRevision: revision, Identity: identity})
 				}
@@ -544,7 +547,7 @@ func TestPoolStage1BRestartAndCorruption(t *testing.T) {
 					t.Fatal("write fixture")
 				}
 			case "identity-mismatch":
-				auth.Metadata["access_token"] = "synthetic-other"
+				auth.Metadata["account_id"] = "synthetic-account-id-other"
 			case "authorization-replay":
 				record.Revision--
 				writePoolGrant(t, file, record)
