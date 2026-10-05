@@ -19,7 +19,12 @@ func (h *Handler) GetPoolTrust(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "pool_admission_required"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"revision": revision, "identities": identities, "in_flight": h.authManager.PoolInFlightSnapshot()})
+	pending, err := h.authManager.PoolPendingIdentities()
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "pool_admission_required"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"revision": revision, "identities": identities, "pending_identities": pending, "in_flight": h.authManager.PoolInFlightSnapshot()})
 }
 
 func decodePoolCommand(c *gin.Context, command any) bool {

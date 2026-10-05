@@ -103,6 +103,51 @@ func (m *Manager) PoolTrustSnapshot() (uint64, []PoolTrustRecord, error) {
 	return record.Revision, items, nil
 }
 
+// PoolPendingIdentities reports the loaded codex OAuth identities that do not
+// yet have a trusted record bound to their current credential digest, together
+// with the exact credential digest promotion must present. Without this the
+// first promotion of an identity is unachievable for an operator: the promote
+// command requires the digest, and the digest is only well-defined after the
+// service layer finished preparing the loaded credential. The values are
+// SHA-256 digests over non-secret references and are only reachable behind
+// the authenticated management plane.
+func (m *Manager) PoolPendingIdentities() ([]PoolIdentityExpectation, error) {
+	if m == nil || m.poolGuard == nil {
+		return nil, ErrPoolGuard
+	}
+	// Sequential, never nested: poolGrants takes the journal lock internally
+	// (mirroring PoolTrustSnapshot), then m.mu → journalMu matches the
+	// selection-path lock order.
+	if _, err := m.poolGrants(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	m.poolGuard.journalMu.Lock()
+	defer m.poolGuard.journalMu.Unlock()
+	items := make([]PoolIdentityExpectation, 0)
+	for _, auth := range m.auths {
+		if auth == nil || auth.Provider != "codex" || auth.AuthKind() != AuthKindOAuth {
+			continue
+		}
+		digest := PoolCredentialDigest(auth)
+		if digest == "" {
+			continue
+		}
+		if trust, ok := m.poolGuard.trust[auth.ID]; ok && trust.State == PoolTrustTrusted && trust.CredentialDigest == digest {
+			continue
+		}
+		items = append(items, PoolIdentityExpectation{
+			AuthID:           auth.ID,
+			Provider:         auth.Provider,
+			CredentialDigest: digest,
+			Generation:       m.poolGuard.trust[auth.ID].Generation,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].AuthID < items[j].AuthID })
+	return items, nil
+}
+
 // Promotion deliberately names every identity trusted in the new snapshot.
 // Advancing the global authorization version never implicitly reapproves others.
 func (m *Manager) PromotePoolIdentities(ctx context.Context, command PoolPromotion) error {
