@@ -597,7 +597,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			startExec := time.Now()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
-			if provider == "codex" && errExec != nil && cliproxyexecutor.UpstreamWorkObserved(execCtx) {
+			if errExec != nil && mustStopReplayAfterDispatch(execCtx, provider, errExec) {
 				return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 			}
 			durationExec := time.Since(startExec)
@@ -1179,6 +1179,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
+			if isRequestTerminatedError(errStream) || isRequestStopError(errStream) {
+				return nil, errStream
+			}
 			if hasUpstreamExecutionAttempt(errStream) {
 				upstreamErr = errStream
 			}

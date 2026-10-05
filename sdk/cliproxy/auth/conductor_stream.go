@@ -242,7 +242,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		startStream := time.Now()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
-		if provider == "codex" && errStream != nil && cliproxyexecutor.UpstreamWorkObserved(ctx) {
+		if errStream != nil && mustStopReplayAfterDispatch(ctx, provider, errStream) {
 			return nil, wrapRequestStopError(errStream)
 		}
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -321,7 +321,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		bootstrapErr = markUpstreamExecutionAttemptFromContext(ctx, bootstrapErr)
-		if provider == "codex" && bootstrapErr != nil && cliproxyexecutor.UpstreamWorkObserved(ctx) {
+		if bootstrapErr != nil && mustStopReplayAfterDispatch(ctx, provider, bootstrapErr) {
 			discardStreamChunks(streamResult.Chunks)
 			return nil, wrapRequestStopError(bootstrapErr)
 		}
@@ -441,7 +441,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := markUpstreamExecutionAttemptFromContext(ctx, &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true})
-			if provider == "codex" && cliproxyexecutor.UpstreamWorkObserved(ctx) {
+			if mustStopReplayAfterDispatch(ctx, provider, emptyErr) {
 				return nil, wrapRequestStopError(emptyErr)
 			}
 			currentErr := newStreamBootstrapError(emptyErr, streamResult.Headers)
