@@ -87,9 +87,20 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		apiKey = a.Attributes["api_key"]
 		baseURL = a.Attributes["base_url"]
 	}
-	if apiKey == "" && a.Metadata != nil {
-		if v, ok := a.Metadata["access_token"].(string); ok {
-			apiKey = v
+	if a.Metadata != nil {
+		// Same metadata fallback for both credential fields: file-based auth
+		// records persist their fields as metadata, so an operator-provisioned
+		// per-credential upstream override is honored the same way the OAuth
+		// bearer token is.
+		if apiKey == "" {
+			if v, ok := a.Metadata["access_token"].(string); ok {
+				apiKey = v
+			}
+		}
+		if baseURL == "" {
+			if v, ok := a.Metadata["base_url"].(string); ok {
+				baseURL = strings.TrimSpace(v)
+			}
 		}
 	}
 	return
