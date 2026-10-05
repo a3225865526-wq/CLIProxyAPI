@@ -17,6 +17,10 @@ const (
 )
 
 // The generation is an accepted 1A journal revision, not a separate counter.
+// IdentityVersion reports which credential identity schema the bound digest
+// was computed with: 0 marks a legacy v1 record (implicit unversioned digest,
+// kept loadable but fail-closed — a v1 digest can never match the canonical
+// v2 identity), CredentialSecurityIdentityVersion marks current records.
 type PoolTrustRecord struct {
 	AuthID               string `json:"auth_id"`
 	Provider             string `json:"provider"`
@@ -24,6 +28,7 @@ type PoolTrustRecord struct {
 	State                string `json:"state"`
 	AuthorizationVersion uint64 `json:"authorization_version"`
 	Generation           uint64 `json:"generation"`
+	IdentityVersion      int    `json:"identity_version,omitempty"`
 }
 
 type PoolIdentityExpectation struct {
@@ -31,6 +36,7 @@ type PoolIdentityExpectation struct {
 	Provider         string `json:"provider"`
 	CredentialDigest string `json:"credential_digest"`
 	Generation       uint64 `json:"generation"`
+	IdentityVersion  int    `json:"identity_version,omitempty"`
 }
 
 type PoolPromotion struct {
@@ -51,6 +57,9 @@ func validPoolTrust(checkpoint poolCheckpoint) bool {
 	for _, item := range checkpoint.Trust {
 		digest, err := hex.DecodeString(item.CredentialDigest)
 		if item.AuthID == "" || item.Provider == "" || seen[item.AuthID] || err != nil || len(digest) != 32 || item.Generation == 0 || item.Generation > checkpoint.Revision || item.AuthorizationVersion == 0 || item.AuthorizationVersion > checkpoint.Revision {
+			return false
+		}
+		if item.IdentityVersion != 0 && item.IdentityVersion != CredentialSecurityIdentityVersion {
 			return false
 		}
 		if item.State != PoolTrustTrusted && item.State != PoolTrustPending && item.State != PoolTrustRevoked {
@@ -79,7 +88,9 @@ func (guard *poolGuard) trusted(auth *Auth, revision uint64) (PoolTrustRecord, b
 	guard.journalMu.Lock()
 	defer guard.journalMu.Unlock()
 	item, ok := guard.trust[auth.ID]
-	return item, ok && item.State == PoolTrustTrusted && item.AuthorizationVersion == revision && item.Provider == auth.Provider && item.CredentialDigest == PoolCredentialDigest(auth)
+	// Only current-version records admit: a legacy v1 digest can never be
+	// proven equivalent to the canonical identity, so it never admits.
+	return item, ok && item.State == PoolTrustTrusted && item.AuthorizationVersion == revision && item.Provider == auth.Provider && item.IdentityVersion == CredentialSecurityIdentityVersion && item.CredentialDigest == PoolCredentialDigest(auth)
 }
 
 // PoolTrustSnapshot reports non-secret security records, independently of health.
@@ -104,12 +115,15 @@ func (m *Manager) PoolTrustSnapshot() (uint64, []PoolTrustRecord, error) {
 }
 
 // PoolPendingIdentities reports the loaded codex OAuth identities that do not
-// yet have a trusted record bound to their current credential digest, together
-// with the exact credential digest promotion must present. Without this the
-// first promotion of an identity is unachievable for an operator: the promote
-// command requires the digest, and the digest is only well-defined after the
-// service layer finished preparing the loaded credential. The values are
-// SHA-256 digests over non-secret references and are only reachable behind
+// yet have a trusted record bound to their current canonical credential digest,
+// together with the exact digest promotion must present. This includes legacy
+// v1 trust records (identity_version 0): their stored digest predates the
+// canonical identity and can never match again, so they surface here as
+// reauthorization required until the operator re-promotes explicitly. Without
+// this the first promotion of an identity is unachievable for an operator: the
+// promote command requires the digest, and the digest is only well-defined
+// after the service layer finished preparing the loaded credential. The values
+// are SHA-256 digests over non-secret references and are only reachable behind
 // the authenticated management plane.
 func (m *Manager) PoolPendingIdentities() ([]PoolIdentityExpectation, error) {
 	if m == nil || m.poolGuard == nil {
@@ -134,7 +148,7 @@ func (m *Manager) PoolPendingIdentities() ([]PoolIdentityExpectation, error) {
 		if digest == "" {
 			continue
 		}
-		if trust, ok := m.poolGuard.trust[auth.ID]; ok && trust.State == PoolTrustTrusted && trust.CredentialDigest == digest {
+		if trust, ok := m.poolGuard.trust[auth.ID]; ok && trust.State == PoolTrustTrusted && trust.CredentialDigest == digest && trust.IdentityVersion == CredentialSecurityIdentityVersion {
 			continue
 		}
 		items = append(items, PoolIdentityExpectation{
@@ -142,6 +156,7 @@ func (m *Manager) PoolPendingIdentities() ([]PoolIdentityExpectation, error) {
 			Provider:         auth.Provider,
 			CredentialDigest: digest,
 			Generation:       m.poolGuard.trust[auth.ID].Generation,
+			IdentityVersion:  CredentialSecurityIdentityVersion,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].AuthID < items[j].AuthID })
@@ -216,6 +231,9 @@ func (m *Manager) commitPoolTrust(ctx context.Context, expected uint64, identiti
 		if auth == nil || auth.AuthKind() != AuthKindOAuth || seen[identity.AuthID] || auth.Provider != identity.Provider || PoolCredentialDigest(auth) != identity.CredentialDigest || old.Generation != identity.Generation {
 			return ErrPoolGuard
 		}
+		if identity.IdentityVersion != 0 && identity.IdentityVersion != CredentialSecurityIdentityVersion {
+			return ErrPoolGuard
+		}
 		seen[identity.AuthID] = true
 		if state == PoolTrustTrusted {
 			if auth.Provider != "codex" {
@@ -236,7 +254,7 @@ func (m *Manager) commitPoolTrust(ctx context.Context, expected uint64, identiti
 		nextByID[item.AuthID] = item
 	}
 	for _, identity := range identities {
-		nextByID[identity.AuthID] = PoolTrustRecord{AuthID: identity.AuthID, Provider: identity.Provider, CredentialDigest: identity.CredentialDigest, State: state, AuthorizationVersion: nextRevision, Generation: nextRevision}
+		nextByID[identity.AuthID] = PoolTrustRecord{AuthID: identity.AuthID, Provider: identity.Provider, CredentialDigest: identity.CredentialDigest, State: state, AuthorizationVersion: nextRevision, Generation: nextRevision, IdentityVersion: CredentialSecurityIdentityVersion}
 	}
 	nextTrust = nil
 	for _, item := range nextByID {

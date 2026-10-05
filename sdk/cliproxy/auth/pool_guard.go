@@ -2,8 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -57,7 +55,10 @@ func (m *Manager) poolExecutionContext(ctx context.Context) (context.Context, er
 // or client request metadata. The file must be mounted outside the auth store.
 // No grant is shipped or generated automatically by this implementation.
 type PoolGrant struct {
-	AuthID           string   `json:"auth_id"`
+	AuthID string `json:"auth_id"`
+	// Provider and CredentialDigest must match the canonical credential
+	// security identity (sdk/cliproxy/auth PoolCredentialDigest,
+	// CredentialSecurityIdentityVersion) of the granted credential.
 	Provider         string   `json:"provider"`
 	CredentialDigest string   `json:"credential_digest"`
 	Models           []string `json:"models"`
@@ -108,33 +109,6 @@ func (m *Manager) PoolRole() string {
 		return ""
 	}
 	return m.poolGuard.role
-}
-
-// PoolCredentialDigest hashes the execution credential in memory. It never
-// returns credential contents. Rotation changes the digest and closes admission
-// until a trusted promotion updates the separate grant; refresh cannot self-admit.
-func PoolCredentialDigest(auth *Auth) string {
-	if auth == nil {
-		return ""
-	}
-	metadata := make(map[string]any, len(auth.Metadata))
-	for key, value := range auth.Metadata {
-		if key != "disabled" {
-			metadata[key] = value
-		}
-	}
-	payload, err := json.Marshal(struct {
-		ID         string
-		Provider   string
-		FileName   string
-		Attributes map[string]string
-		Metadata   map[string]any
-	}{auth.ID, auth.Provider, auth.FileName, auth.Attributes, metadata})
-	if err != nil {
-		return ""
-	}
-	digest := sha256.Sum256(payload)
-	return hex.EncodeToString(digest[:])
 }
 
 func (guard *poolGuard) grants() (*PoolGrantFile, error) {

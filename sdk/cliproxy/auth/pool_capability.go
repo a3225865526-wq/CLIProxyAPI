@@ -32,7 +32,8 @@ const (
 
 // PoolModelCapability is one account×model admission record. Model is stored in
 // canonical form; matching is exact on the canonical key with no prefix,
-// substring, or case folding.
+// substring, or case folding. IdentityVersion reports the credential identity
+// schema of the bound digest (0 = legacy v1, fail-closed by digest mismatch).
 type PoolModelCapability struct {
 	AuthID           string `json:"auth_id"`
 	Provider         string `json:"provider"`
@@ -40,6 +41,7 @@ type PoolModelCapability struct {
 	Model            string `json:"model"`
 	State            string `json:"state"`
 	Generation       uint64 `json:"generation"`
+	IdentityVersion  int    `json:"identity_version,omitempty"`
 }
 
 type PoolModelGrant struct {
@@ -73,6 +75,9 @@ func validPoolCapabilities(record *PoolGrantFile) bool {
 	for _, item := range record.Capabilities {
 		digest, err := hex.DecodeString(item.CredentialDigest)
 		if item.AuthID == "" || item.Provider == "" || err != nil || len(digest) != 32 {
+			return false
+		}
+		if item.IdentityVersion != 0 && item.IdentityVersion != CredentialSecurityIdentityVersion {
 			return false
 		}
 		if item.Model == "" || item.Model != canonicalPoolModel(item.Model) {
@@ -248,6 +253,7 @@ func (m *Manager) commitPoolModelCapabilityLocked(ctx context.Context, command P
 			item.State = state
 			item.Provider = command.Identity.Provider
 			item.CredentialDigest = command.Identity.CredentialDigest
+			item.IdentityVersion = CredentialSecurityIdentityVersion
 			if state == PoolCapabilityVerified {
 				item.Generation = command.Identity.Generation
 			}
@@ -256,7 +262,7 @@ func (m *Manager) commitPoolModelCapabilityLocked(ctx context.Context, command P
 		nextCapabilities = append(nextCapabilities, item)
 	}
 	if !replaced {
-		nextCapabilities = append(nextCapabilities, PoolModelCapability{AuthID: command.Identity.AuthID, Provider: command.Identity.Provider, CredentialDigest: command.Identity.CredentialDigest, Model: key, State: state, Generation: command.Identity.Generation})
+		nextCapabilities = append(nextCapabilities, PoolModelCapability{AuthID: command.Identity.AuthID, Provider: command.Identity.Provider, CredentialDigest: command.Identity.CredentialDigest, Model: key, State: state, Generation: command.Identity.Generation, IdentityVersion: CredentialSecurityIdentityVersion})
 	}
 	sort.Slice(nextCapabilities, func(i, j int) bool {
 		if nextCapabilities[i].AuthID != nextCapabilities[j].AuthID {
