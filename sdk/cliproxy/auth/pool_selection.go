@@ -18,6 +18,19 @@ func firstPoolGrantModel(manager *Manager, auth *Auth) string {
 	return ""
 }
 
+// requestedModelFromOptions recovers the client-requested model for observability.
+func requestedModelFromOptions(opts cliproxyexecutor.Options) string {
+	if opts.Metadata == nil {
+		return ""
+	}
+	requested, _ := opts.Metadata[cliproxyexecutor.RequestedModelMetadataKey].(string)
+	return requested
+}
+
+// poolCandidateAllowed filters pool accounts during selection. The check runs on
+// the requested model and, if that differs, on the account-resolved canonical
+// model, so an alias can never select an account whose canonical model is not
+// admitted. Execution-time begin and the dispatch fence re-check the final model.
 func (manager *Manager) poolCandidateAllowed(auth *Auth, model string, opts cliproxyexecutor.Options) bool {
 	if manager.poolGuard == nil {
 		return true
@@ -26,6 +39,16 @@ func (manager *Manager) poolCandidateAllowed(auth *Auth, model string, opts clip
 	if err != nil {
 		return false
 	}
-	_, err = manager.poolGrant(auth, model, caps)
-	return err == nil
+	record, err := manager.poolGrants()
+	if err != nil {
+		return false
+	}
+	if err := manager.poolModelCheck(record, auth, model, caps); err == nil {
+		return true
+	}
+	resolved := manager.selectionModelForAuth(auth, model)
+	if resolved == "" || resolved == model {
+		return false
+	}
+	return manager.poolModelCheck(record, auth, resolved, caps) == nil
 }

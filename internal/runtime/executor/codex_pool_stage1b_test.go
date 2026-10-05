@@ -58,6 +58,13 @@ func codexPoolFixture(t *testing.T, baseURL string, ws bool) (*coreauth.Manager,
 	if err := manager.PromotePoolIdentities(context.Background(), coreauth.PoolPromotion{ExpectedRevision: 1, Identities: []coreauth.PoolIdentityExpectation{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: coreauth.PoolCredentialDigest(auth)}}}); err != nil {
 		t.Fatal(err)
 	}
+	revision, states, err := manager.PoolTrustSnapshot()
+	if err != nil || len(states) != 1 {
+		t.Fatal("trust fixture", err)
+	}
+	if err := manager.GrantPoolModelCapability(context.Background(), coreauth.PoolModelGrant{ExpectedRevision: revision, Identity: coreauth.PoolIdentityExpectation{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: coreauth.PoolCredentialDigest(auth), Generation: states[0].Generation}, Model: "synthetic-native"}); err != nil {
+		t.Fatal(err)
+	}
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 	return manager, auth

@@ -71,10 +71,11 @@ type PoolGrant struct {
 }
 
 type PoolGrantFile struct {
-	GuardVersion int         `json:"guard_version"`
-	ExecutorID   string      `json:"executor_id"`
-	Revision     uint64      `json:"revision"`
-	Grants       []PoolGrant `json:"grants"`
+	GuardVersion int                   `json:"guard_version"`
+	ExecutorID   string                `json:"executor_id"`
+	Revision     uint64                `json:"revision"`
+	Grants       []PoolGrant           `json:"grants"`
+	Capabilities []PoolModelCapability `json:"capabilities,omitempty"`
 }
 
 type poolGuard struct {
@@ -152,7 +153,7 @@ func (guard *poolGuard) grants() (*PoolGrantFile, error) {
 	var record PoolGrantFile
 	decoder := json.NewDecoder(io.LimitReader(file, 1024*1024+1))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&record) != nil || record.GuardVersion != PoolGuardVersion || record.ExecutorID != guard.executorID || !validPoolExecutorID(guard.executorID) || record.Revision < 1 || len(record.Grants) > 1024 {
+	if decoder.Decode(&record) != nil || record.GuardVersion != PoolGuardVersion || record.ExecutorID != guard.executorID || !validPoolExecutorID(guard.executorID) || record.Revision < 1 || len(record.Grants) > 1024 || !validPoolCapabilities(&record) {
 		return nil, ErrPoolGuard
 	}
 	var extra any
@@ -228,6 +229,14 @@ func (m *Manager) poolGrant(auth *Auth, model string, capabilities []string) (*P
 }
 
 func (m *Manager) matchPoolGrant(record *PoolGrantFile, auth *Auth, model string, capabilities []string) (*PoolGrant, error) {
+	grant, _, err := m.matchPoolGrantReason(record, auth, model, capabilities)
+	return grant, err
+}
+
+// matchPoolGrantReason validates the operator grant floor and returns a
+// structured denial reason for observability on failure.
+func (m *Manager) matchPoolGrantReason(record *PoolGrantFile, auth *Auth, model string, capabilities []string) (*PoolGrant, string, error) {
+	const structural = "grant_invalid"
 	digest := PoolCredentialDigest(auth)
 	now := time.Now().Unix()
 	var match *PoolGrant
@@ -237,27 +246,30 @@ func (m *Manager) matchPoolGrant(record *PoolGrantFile, auth *Auth, model string
 			continue
 		}
 		if match != nil {
-			return nil, ErrPoolGuard
+			return nil, structural, ErrPoolGuard
 		}
 		match = grant
 	}
-	if match == nil || !match.Enabled || match.Provider != auth.Provider || digest == "" || match.CredentialDigest != digest || match.ExpiresAt <= now || match.ExpiresAt > now+1800 || match.MaxConcurrency < 1 || match.MaxConcurrency > 64 || len(match.SourceEvidence) == 0 || len(match.TestEvidence) == 0 || !slices.Contains(match.Models, model) {
-		return nil, ErrPoolGuard
+	if match == nil || !match.Enabled || match.Provider != auth.Provider || digest == "" || match.CredentialDigest != digest || match.ExpiresAt <= now || match.ExpiresAt > now+1800 || match.MaxConcurrency < 1 || match.MaxConcurrency > 64 || len(match.SourceEvidence) == 0 || len(match.TestEvidence) == 0 {
+		return nil, structural, ErrPoolGuard
+	}
+	if !slices.Contains(match.Models, model) {
+		return nil, PoolDenialModelNotAllowed, ErrPoolGuard
 	}
 	for _, reference := range append(slices.Clone(match.SourceEvidence), match.TestEvidence...) {
 		if strings.TrimSpace(reference) == "" {
-			return nil, ErrPoolGuard
+			return nil, structural, ErrPoolGuard
 		}
 	}
 	for _, capability := range append([]string{"text_chat", "exact_usage"}, capabilities...) {
 		if !slices.Contains(match.Capabilities, capability) {
-			return nil, ErrPoolGuard
+			return nil, structural, ErrPoolGuard
 		}
 		if capability == "tools" && !match.NativeTools {
-			return nil, ErrPoolGuard
+			return nil, structural, ErrPoolGuard
 		}
 	}
-	return match, nil
+	return match, "", nil
 }
 
 func poolRequestCapabilities(req cliproxyexecutor.Request, stream bool) ([]string, error) {
@@ -330,7 +342,7 @@ func (executor *poolExecutor) PrepareRequest(*http.Request, *Auth) error {
 	return ErrPoolGuard
 }
 
-func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, stream bool, consumeAttempt bool) (*poolLease, error) {
+func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, consumeAttempt bool) (*poolLease, error) {
 	guard := executor.manager.poolGuard
 	if ctx == nil {
 		ctx = context.Background()
@@ -343,7 +355,7 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	}
 	guard.mu.Lock()
 	defer guard.mu.Unlock()
-	if auth == nil || auth.Provider != "codex" {
+	if auth == nil || auth.Provider != "codex" || auth.AuthKind() != AuthKindOAuth {
 		return nil, ErrPoolGuard
 	}
 	// Unsupported executors cannot claim a dispatch fence merely by registration.
@@ -353,7 +365,7 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	}
 	executor.manager.mu.RLock()
 	current := executor.manager.auths[auth.ID]
-	currentMatches := current != nil && !current.Disabled && current.Status != StatusDisabled && PoolCredentialDigest(current) == PoolCredentialDigest(auth)
+	currentMatches := current != nil && !current.Disabled && current.Status != StatusDisabled && !current.Unavailable && PoolCredentialDigest(current) == PoolCredentialDigest(auth)
 	executor.manager.mu.RUnlock()
 	if !currentMatches {
 		return nil, ErrPoolGuard
@@ -362,18 +374,32 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	if err != nil {
 		return nil, err
 	}
-	grant, err := executor.manager.poolGrant(auth, req.Model, caps)
+	record, err := executor.manager.poolGrants()
 	if err != nil {
 		return nil, err
+	}
+	grant, reason, err := executor.manager.matchPoolGrantReason(record, auth, req.Model, caps)
+	if err != nil {
+		poolLogModelDecision(ctx, auth, requestedModelFromOptions(opts), req.Model, false, reason, record.Revision, 0)
+		return nil, err
+	}
+	reason, admitErr := executor.manager.poolModelAdmitted(record, auth, req.Model)
+	if admitErr != nil {
+		poolLogModelDecision(ctx, auth, requestedModelFromOptions(opts), req.Model, false, reason, record.Revision, 0)
+		return nil, admitErr
 	}
 	guard.journalMu.Lock()
 	trust := guard.trust[auth.ID]
 	guard.journalMu.Unlock()
+	if trust.State != PoolTrustTrusted || trust.AuthorizationVersion != record.Revision {
+		return nil, ErrPoolGuard
+	}
 	guard.countsMu.Lock()
 	defer guard.countsMu.Unlock()
 	if guard.counts[auth.ID] >= grant.MaxConcurrency {
 		return nil, ErrPoolGuard
 	}
+	poolLogModelDecision(ctx, auth, requestedModelFromOptions(opts), req.Model, true, "", record.Revision, trust.Generation)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -382,7 +408,7 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	}
 	child, cancel := context.WithCancelCause(ctx)
 	guard.nextLease++
-	lease := &poolLease{PoolInFlight: PoolInFlight{RequestID: guard.nextLease, AuthID: auth.ID, Provider: auth.Provider, ExecutorID: guard.executorID, CredentialDigest: PoolCredentialDigest(auth), AuthorizationVersion: trust.AuthorizationVersion, Generation: trust.Generation}, manager: executor.manager, auth: auth.Clone(), req: req, caps: caps, ctx: child, cancel: cancel, consumeAttempt: consumeAttempt}
+	lease := &poolLease{PoolInFlight: PoolInFlight{RequestID: guard.nextLease, AuthID: auth.ID, Provider: auth.Provider, ExecutorID: guard.executorID, CredentialDigest: PoolCredentialDigest(auth), AuthorizationVersion: trust.AuthorizationVersion, Generation: trust.Generation}, manager: executor.manager, auth: auth.Clone(), req: req, caps: caps, requestedModel: requestedModelFromOptions(opts), ctx: child, cancel: cancel, consumeAttempt: consumeAttempt}
 	lease.ctx = usage.WithCodexMeteringObserver(cliproxyexecutor.WithDispatchGuard(child, lease), lease.observeMetering)
 	lease.stopClose = context.AfterFunc(child, lease.closeResource)
 	if guard.leases == nil {
@@ -394,7 +420,7 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 }
 
 func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	lease, err := executor.begin(ctx, auth, req, false, true)
+	lease, err := executor.begin(ctx, auth, req, opts, false, true)
 	if err != nil {
 		return cliproxyexecutor.Response{}, poolAccountingTermination(err, nil)
 	}
@@ -408,7 +434,7 @@ func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req clipr
 }
 
 func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, resultErr error) {
-	lease, err := executor.begin(ctx, auth, req, true, true)
+	lease, err := executor.begin(ctx, auth, req, opts, true, true)
 	if err != nil {
 		return nil, poolAccountingTermination(err, nil)
 	}
@@ -478,7 +504,7 @@ func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req
 }
 
 func (executor *poolExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	lease, err := executor.begin(ctx, auth, req, false, true)
+	lease, err := executor.begin(ctx, auth, req, opts, false, true)
 	if err != nil {
 		return cliproxyexecutor.Response{}, poolAccountingTermination(err, nil)
 	}

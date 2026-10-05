@@ -110,6 +110,14 @@ func TestPoolStage1BPreDispatchSafeFallback(t *testing.T) {
 	if err := m.PromotePoolIdentities(context.Background(), PoolPromotion{ExpectedRevision: revision, Identities: []PoolIdentityExpectation{identity, {AuthID: second.ID, Provider: second.Provider, CredentialDigest: PoolCredentialDigest(second)}}}); err != nil {
 		t.Fatal(err)
 	}
+	first, _ := m.GetByID(identity.AuthID)
+	secondRegistered, _ := m.GetByID(second.ID)
+	if err := grantPoolModelCapability(t, m, first, "synthetic-native"); err != nil {
+		t.Fatal(err)
+	}
+	if err := grantPoolModelCapability(t, m, secondRegistered, "synthetic-native"); err != nil {
+		t.Fatal(err)
+	}
 	registry.GetGlobalRegistry().RegisterClient(second.ID, second.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}})
 	defer registry.GetGlobalRegistry().UnregisterClient(second.ID)
 	probe := &poolPreDispatchFailure{}
@@ -139,6 +147,13 @@ func explicitPoolPromotion(t *testing.T, m *Manager) {
 	t.Helper()
 	revision, identity := poolExpectation(t, m)
 	if err := m.PromotePoolIdentities(context.Background(), PoolPromotion{ExpectedRevision: revision, Identities: []PoolIdentityExpectation{identity}}); err != nil {
+		t.Fatal(err)
+	}
+	auth, _ := m.GetByID(identity.AuthID)
+	if auth == nil {
+		t.Fatal("promoted identity vanished")
+	}
+	if err := grantPoolModelCapability(t, m, auth, "synthetic-native"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -560,7 +575,7 @@ func TestPoolStage1BResourceCloseExactlyOnce(t *testing.T) {
 	m, _, auth, _, _ := poolGuardFixture(t, "service")
 	wrapped, _ := m.Executor("codex")
 	ctx, _ := m.poolExecutionContext(context.Background())
-	lease, err := wrapped.(*poolExecutor).begin(ctx, auth, cliproxyexecutor.Request{Model: "synthetic-native"}, false, true)
+	lease, err := wrapped.(*poolExecutor).begin(ctx, auth, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{}, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +611,7 @@ func TestPoolStage1BLeaseAcquireRevokeRace(t *testing.T) {
 	var group sync.WaitGroup
 	group.Go(func() {
 		<-start
-		lease, beginErr = wrapped.(*poolExecutor).begin(ctx, auth, cliproxyexecutor.Request{Model: "synthetic-native"}, false, true)
+		lease, beginErr = wrapped.(*poolExecutor).begin(ctx, auth, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{}, false, true)
 	})
 	group.Go(func() { <-start; poolRevoke(t, m) })
 	close(start)

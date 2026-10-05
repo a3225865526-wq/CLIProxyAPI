@@ -85,6 +85,7 @@ type poolLease struct {
 	auth              *Auth
 	req               cliproxyexecutor.Request
 	caps              []string
+	requestedModel    string
 	ctx               context.Context
 	cancel            context.CancelCauseFunc
 	once              sync.Once
@@ -208,6 +209,13 @@ func (lease *poolLease) authorizeOperation(connect bool) error {
 		return ErrPoolGuard
 	}
 	if _, err := lease.manager.matchPoolGrant(record, lease.auth, lease.req.Model, lease.caps); err != nil {
+		return err
+	}
+	// Last admission boundary before upstream work: the canonical model's
+	// capability must still be valid at dispatch time, not only at selection.
+	reason, err := lease.manager.poolModelAdmitted(record, lease.auth, lease.req.Model)
+	if err != nil {
+		poolLogModelDecision(lease.ctx, lease.auth, lease.requestedModel, lease.req.Model, false, reason, record.Revision, lease.Generation)
 		return err
 	}
 	if lease.consumeAttempt && !lease.Dispatched {

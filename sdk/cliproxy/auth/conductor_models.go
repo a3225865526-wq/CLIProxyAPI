@@ -305,12 +305,27 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 		return nil
 	}
 	now := time.Now()
+	// Pool accounts must never hand an unadmitted model to the executor: filter
+	// candidate upstream models by the capability ledger before dispatch.
+	var poolRecord *PoolGrantFile
+	if m.poolGuard != nil {
+		record, err := m.poolGrants()
+		if err != nil {
+			return nil
+		}
+		poolRecord = record
+	}
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
 		if blocked {
 			continue
+		}
+		if poolRecord != nil {
+			if err := m.poolModelCheck(poolRecord, auth, upstreamModel, nil); err != nil {
+				continue
+			}
 		}
 		out = append(out, upstreamModel)
 	}

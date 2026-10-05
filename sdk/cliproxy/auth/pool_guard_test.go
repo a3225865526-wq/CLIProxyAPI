@@ -83,6 +83,11 @@ func poolGuardFixture(t *testing.T, role string) (*Manager, *poolProbeExecutor, 
 			t.Fatal(err)
 		}
 		record.Revision++
+		if err := grantPoolModelCapability(t, m, auth, record.Grants[0].Models[0]); err != nil {
+			t.Fatal(err)
+		}
+		record.Revision++
+		record.Capabilities = []PoolModelCapability{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth), Model: record.Grants[0].Models[0], State: PoolCapabilityVerified, Generation: record.Revision - 1}}
 		registered, _ = m.GetByID(auth.ID)
 	}
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}, {ID: "synthetic-other"}})
@@ -99,6 +104,38 @@ func writePoolGrant(t *testing.T, file string, record PoolGrantFile) {
 	if err := os.WriteFile(file, body, 0600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// grantPoolModelCapability exercises the STEP 3 grant command for one model.
+func grantPoolModelCapability(t *testing.T, m *Manager, auth *Auth, model string) error {
+	t.Helper()
+	revision, states, err := m.PoolTrustSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := PoolIdentityExpectation{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth)}
+	for _, state := range states {
+		if state.AuthID == auth.ID {
+			identity.Generation = state.Generation
+		}
+	}
+	return m.GrantPoolModelCapability(context.Background(), PoolModelGrant{ExpectedRevision: revision, Identity: identity, Model: model})
+}
+
+// revokePoolModelCapability exercises the STEP 3 revoke command for one model.
+func revokePoolModelCapability(t *testing.T, m *Manager, auth *Auth, model string) error {
+	t.Helper()
+	revision, states, err := m.PoolTrustSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := PoolIdentityExpectation{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth)}
+	for _, state := range states {
+		if state.AuthID == auth.ID {
+			identity.Generation = state.Generation
+		}
+	}
+	return m.RevokePoolModelCapability(context.Background(), PoolModelRevoke{ExpectedRevision: revision, Identity: identity, Model: model})
 }
 
 func TestPoolGuardStagingAndUnknownRoleNeverExecute(t *testing.T) {

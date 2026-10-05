@@ -1754,11 +1754,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	registryRef := registry.GetGlobalRegistry()
 	targetKey := canonicalSchedulingProvider(provider)
+	poolRejected := false
 	for _, candidate := range m.auths {
 		if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey || candidate.Disabled {
-			continue
-		}
-		if !m.poolCandidateAllowed(candidate, model, opts) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -1770,6 +1768,16 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
+		if m.poolGuard != nil {
+			// Model capability admission governs pool selection and subsumes the
+			// registry model-set heuristic for these accounts.
+			if !m.poolCandidateAllowed(candidate, model, opts) {
+				poolRejected = true
+				continue
+			}
+			candidates = append(candidates, candidate)
+			continue
+		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
@@ -1777,6 +1785,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if poolRejected {
+			return nil, nil, &Error{Code: "pool_no_eligible_account", Message: "no pool account admitted for model", HTTPStatus: http.StatusServiceUnavailable}
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
@@ -2087,11 +2098,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	poolRejected := false
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
-			continue
-		}
-		if !m.poolCandidateAllowed(candidate, model, opts) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -2113,6 +2122,16 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executorLocked(providerKey); !ok {
 			continue
 		}
+		if m.poolGuard != nil {
+			// Model capability admission governs pool selection and subsumes the
+			// registry model-set heuristic for these accounts.
+			if !m.poolCandidateAllowed(candidate, model, opts) {
+				poolRejected = true
+				continue
+			}
+			candidates = append(candidates, candidate)
+			continue
+		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
@@ -2120,6 +2139,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if poolRejected {
+			return nil, nil, "", &Error{Code: "pool_no_eligible_account", Message: "no pool account admitted for model", HTTPStatus: http.StatusServiceUnavailable}
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
