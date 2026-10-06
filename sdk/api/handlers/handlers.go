@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -114,6 +115,18 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 		return []byte(trimmed)
 	}
 
+	// When the cause is a structured auth error, carry its machine-readable
+	// code onto the wire (e.g. auth_unavailable / auth_not_found for
+	// pool-exhaustion). Downstream routers classify pool exhaustion by exactly
+	// matching this code, so the status-derived fallback code must not mask
+	// it. Real upstream response bodies are forwarded verbatim above and are
+	// unaffected.
+	structuredCode := ""
+	var structuredErr *coreauth.Error
+	if errors.As(err, &structuredErr) && structuredErr != nil && structuredErr.Code != "" {
+		structuredCode = structuredErr.Code
+	}
+
 	errType := "invalid_request_error"
 	var code string
 	switch status {
@@ -134,6 +147,9 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 			errType = "server_error"
 			code = "internal_server_error"
 		}
+	}
+	if structuredCode != "" {
+		code = structuredCode
 	}
 
 	payload, errMarshal := json.Marshal(ErrorResponse{
