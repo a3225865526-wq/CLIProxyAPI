@@ -20,8 +20,9 @@ func TestBuildErrorResponseBodyCarriesPoolExhaustionCode(t *testing.T) {
 
 	var envelope struct {
 		Error struct {
-			Code string `json:"code"`
-			Type string `json:"type"`
+			Code   string `json:"code"`
+			Type   string `json:"type"`
+			Origin string `json:"origin"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
@@ -32,6 +33,9 @@ func TestBuildErrorResponseBodyCarriesPoolExhaustionCode(t *testing.T) {
 	}
 	if envelope.Error.Type != "server_error" {
 		t.Fatalf("expected server_error type for 503, got %q", envelope.Error.Type)
+	}
+	if envelope.Error.Origin != "local_executor" {
+		t.Fatalf("expected executor provenance origin=local_executor, got %q (body: %s)", envelope.Error.Origin, body)
 	}
 }
 
@@ -50,5 +54,51 @@ func TestBuildErrorResponseBodyKeepsUpstreamBodyVerbatim(t *testing.T) {
 	body := BuildErrorResponseBodyWithError(http.StatusServiceUnavailable, string(upstream), nil)
 	if string(body) != string(upstream) {
 		t.Fatalf("upstream body must be forwarded verbatim, got %s", body)
+	}
+}
+
+// Provenance contract (Stage 4): only executor-synthesized errors carry
+// origin=local_executor. A real provider error echoing auth_unavailable with
+// untrusted provenance must stay distinguishable, and status-derived fallback
+// codes must never claim executor origin.
+func TestBuildErrorResponseBodyProviderEchoCarriesNoExecutorOrigin(t *testing.T) {
+	// A provider body echoing the exhaustion code is forwarded verbatim and
+	// must NOT gain executor provenance.
+	upstream := []byte(`{"error":{"message":"upstream echoed","type":"server_error","code":"auth_unavailable"}}`)
+	body := BuildErrorResponseBodyWithError(http.StatusServiceUnavailable, string(upstream), nil)
+	var envelope struct {
+		Error struct {
+			Origin string `json:"origin"`
+			Code   string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("body is not a JSON envelope: %v\nbody: %s", err, body)
+	}
+	if envelope.Error.Origin != "" {
+		t.Fatalf("forwarded provider body must not gain executor provenance, got origin=%q (body: %s)", envelope.Error.Origin, body)
+	}
+}
+
+func TestBuildErrorResponseBodyStatusFallbackCarriesNoExecutorOrigin(t *testing.T) {
+	body := BuildErrorResponseBodyWithError(http.StatusInternalServerError, "boom", nil)
+	var envelope struct {
+		Error struct {
+			Origin string `json:"origin"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("body is not a JSON envelope: %v\nbody: %s", err, body)
+	}
+	if envelope.Error.Origin != "" {
+		t.Fatalf("status-derived fallback must not claim executor provenance, got origin=%q (body: %s)", envelope.Error.Origin, body)
+	}
+}
+
+func TestBuildErrorResponseBodyAuthNotFoundCarriesExecutorOrigin(t *testing.T) {
+	err := &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
+	body := BuildErrorResponseBodyWithError(http.StatusServiceUnavailable, err.Error(), err)
+	if want := `"origin":"local_executor"`; !bytes.Contains(body, []byte(want)) {
+		t.Fatalf("expected %s in body, got %s", want, body)
 	}
 }

@@ -49,6 +49,12 @@ type ErrorDetail struct {
 	// Code is a short code identifying the error, if applicable.
 	Code string `json:"code,omitempty"`
 
+	// Origin identifies errors synthesized by this executor itself. It is set
+	// only on locally generated structured auth errors, never on provider
+	// bodies forwarded verbatim, so downstream routers can trust the pair
+	// (code, origin) as an executor-local pre-dispatch classification.
+	Origin string `json:"origin,omitempty"`
+
 	// Retryable optionally indicates whether a retry might fix the issue automatically.
 	Retryable *bool `json:"retryable,omitempty"`
 }
@@ -99,14 +105,15 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 		r := false
 		payload, errMarshal := json.Marshal(ErrorResponse{
 			Error: ErrorDetail{
-				Message:   message,
-				Type:      "authentication_error",
-				Code:      "upstream_authentication_required",
+				Message: message,
+				Type:    "authentication_error",
+				Code:    "upstream_authentication_required",
+				Origin:  "local_executor",
 				Retryable: &r,
 			},
 		})
 		if errMarshal != nil {
-			return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"authentication_error","code":"upstream_authentication_required","retryable":false}}`, message))
+			return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"authentication_error","code":"upstream_authentication_required","origin":"local_executor","retryable":false}}`, message))
 		}
 		return payload
 	}
@@ -122,9 +129,15 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 	// it. Real upstream response bodies are forwarded verbatim above and are
 	// unaffected.
 	structuredCode := ""
+	structuredOrigin := ""
 	var structuredErr *coreauth.Error
 	if errors.As(err, &structuredErr) && structuredErr != nil && structuredErr.Code != "" {
 		structuredCode = structuredErr.Code
+		// Provenance contract: this envelope was synthesized by the executor
+		// itself, so downstream routers may trust (code, origin) as an
+		// executor-local pre-dispatch classification. Forwarded provider
+		// bodies never reach this path.
+		structuredOrigin = "local_executor"
 	}
 
 	errType := "invalid_request_error"
@@ -157,6 +170,7 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 			Message: errText,
 			Type:    errType,
 			Code:    code,
+			Origin:  structuredOrigin,
 		},
 	})
 	if errMarshal != nil {
