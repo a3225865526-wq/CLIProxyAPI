@@ -49,7 +49,7 @@ func (e *poolProbeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (
 	return nil, nil
 }
 
-func poolGuardFixture(t *testing.T, role string) (*Manager, *poolProbeExecutor, *Auth, string, PoolGrantFile) {
+func poolGuardFixture(t *testing.T, role string, nativeTools ...bool) (*Manager, *poolProbeExecutor, *Auth, string, PoolGrantFile) {
 	t.Helper()
 	root := t.TempDir()
 	dir := filepath.Join(root, "auths")
@@ -72,6 +72,10 @@ func poolGuardFixture(t *testing.T, role string) (*Manager, *poolProbeExecutor, 
 	auth := &Auth{ID: "synthetic-pool-account", Provider: "codex", FileName: "synthetic-pool-account.json", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Metadata: map[string]any{"access_token": "synthetic-unused", "account_id": "synthetic-account-id", "email": "synthetic-pool-account@staging.invalid"}}
 	record := PoolGrantFile{GuardVersion: PoolGuardVersion, Revision: 1, Grants: []PoolGrant{{AuthID: auth.ID, Provider: auth.Provider, CredentialDigest: PoolCredentialDigest(auth), Models: []string{"synthetic-native"}, Capabilities: []string{"text_chat", "stream_text", "exact_usage"}, Enabled: true, MaxConcurrency: 1, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(), SourceEvidence: []string{"synthetic-source"}, TestEvidence: []string{"synthetic-test"}}}}
 	record.ExecutorID = "synthetic-executor"
+	if len(nativeTools) != 0 && nativeTools[0] {
+		record.Grants[0].Capabilities = append(record.Grants[0].Capabilities, "tools")
+		record.Grants[0].NativeTools = true
+	}
 	writePoolGrant(t, file, record)
 	registered, err := m.Register(context.Background(), auth)
 	if err != nil {

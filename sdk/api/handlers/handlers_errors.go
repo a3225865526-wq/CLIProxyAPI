@@ -46,7 +46,11 @@ var executorExhaustionCodes = map[string]struct{}{
 // guarantees a provider-supplied header of the same name is stripped from
 // every forwarded response.
 func markExecutorLocalErrorOrigin(c *gin.Context, err error) {
-	if c == nil || err == nil {
+	if c == nil || err == nil || coreauth.IsTerminalAuthError(err) {
+		return
+	}
+	if coreauth.IsLocalPoolSelectionError(err) {
+		c.Writer.Header().Set(ExecutorErrorOriginHeader, ExecutorErrorOriginLocal)
 		return
 	}
 	var structuredErr *coreauth.Error

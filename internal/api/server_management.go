@@ -33,6 +33,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/pool/trust/promote", s.mgmt.PromotePoolTrust)
 		mgmt.POST("/pool/trust/revoke", s.mgmt.RevokePoolTrust)
 		mgmt.GET("/pool/models", s.mgmt.GetPoolModels)
+		mgmt.POST("/pool/preflight", s.mgmt.PoolRequestPreflight)
 		mgmt.POST("/pool/models/grant", s.mgmt.GrantPoolModel)
 		mgmt.POST("/pool/models/revoke", s.mgmt.RevokePoolModel)
 		mgmt.GET("/config", s.mgmt.GetConfig)
@@ -217,7 +218,7 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 			role := s.handlers.AuthManager.PoolRole()
 			if role != "" && role != "staging" {
 				path, method := c.Request.URL.Path, c.Request.Method
-				allowed := role == "service" && ((method == http.MethodGet && (path == "/v0/management/auth-files" || path == "/v0/management/pool/isolation" || path == "/v0/management/pool/trust" || path == "/v0/management/pool/models")) || (method == http.MethodPost && (path == "/v0/management/pool/trust/promote" || path == "/v0/management/pool/trust/revoke" || path == "/v0/management/pool/models/grant" || path == "/v0/management/pool/models/revoke")) || (method == http.MethodPatch && path == "/v0/management/auth-files/status") || (method == http.MethodDelete && path == "/v0/management/auth-files"))
+				allowed := role == "service" && ((method == http.MethodGet && (path == "/v0/management/auth-files" || path == "/v0/management/pool/isolation" || path == "/v0/management/pool/trust" || path == "/v0/management/pool/models")) || (method == http.MethodPost && (path == "/v0/management/pool/preflight" || path == "/v0/management/pool/trust/promote" || path == "/v0/management/pool/trust/revoke" || path == "/v0/management/pool/models/grant" || path == "/v0/management/pool/models/revoke")) || (method == http.MethodPatch && path == "/v0/management/auth-files/status") || (method == http.MethodDelete && path == "/v0/management/auth-files"))
 				if !allowed {
 					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "pool_service_management_restricted"})
 					return

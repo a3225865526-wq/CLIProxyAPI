@@ -17,6 +17,10 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
+type stage72ManagementExecutor struct{ refreshRecordExecutor }
+
+func (*stage72ManagementExecutor) PoolDispatchFencing() bool { return true }
+
 func TestPoolStage3ManagementAPI(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "auths")
@@ -50,6 +54,7 @@ func TestPoolStage3ManagementAPI(t *testing.T) {
 	engine.GET("/models", handler.GetPoolModels)
 	engine.POST("/models/grant", handler.GrantPoolModel)
 	engine.POST("/models/revoke", handler.RevokePoolModel)
+	engine.POST("/preflight", handler.PoolRequestPreflight)
 	if err := manager.PromotePoolIdentities(context.Background(), coreauth.PoolPromotion{ExpectedRevision: 1, Identities: []coreauth.PoolIdentityExpectation{identity}}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +78,53 @@ func TestPoolStage3ManagementAPI(t *testing.T) {
 	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/models", nil))
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"model":"synthetic-native"`) {
 		t.Fatal("capability snapshot missing", response.Body.String())
+	}
+	manager.RegisterExecutor(&stage72ManagementExecutor{refreshRecordExecutor{provider: "codex"}})
+	server := httptest.NewServer(engine)
+	defer server.Close()
+	journalBefore, err := os.ReadFile(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		schema string
+		count  int
+	}{
+		{`{}`, 1}, {`{"tools":[]}`, 1}, {`{"tools":null}`, 1},
+		{`{"tools":[{"type":"function","name":"x"}]}`, 0},
+	} {
+		resp, err := http.Post(server.URL+"/preflight", "application/json", strings.NewReader(`{"model":"synthetic-native","request":`+tc.schema+`}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result coreauth.PoolPreflightResult
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 || result.EligibleCount != tc.count {
+			t.Fatalf("management preflight=%+v status=%d", result, resp.StatusCode)
+		}
+	}
+	journalAfter, err := os.ReadFile(checkpoint)
+	if err != nil || !bytes.Equal(journalBefore, journalAfter) {
+		t.Fatal("management preflight wrote journal", err)
+	}
+	for _, body := range []string{
+		`{"model":"synthetic-native","request":{"stream":true}}`,
+		`{"model":"synthetic-native","request":{"model":"different"}}`,
+		`{"model":"synthetic-native","request":{}} {}`,
+		`{"model":"synthetic-native","request":{},"unknown":true}`,
+		`{"model":"synthetic-native","request":null}`,
+	} {
+		resp, err := http.Post(server.URL+"/preflight", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("invalid schema accepted: %d", resp.StatusCode)
+		}
 	}
 	revoke, _ := json.Marshal(coreauth.PoolModelRevoke{ExpectedRevision: 3, Identity: identity, Model: "synthetic-native"})
 	response = httptest.NewRecorder()

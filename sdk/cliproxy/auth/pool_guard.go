@@ -138,6 +138,10 @@ func (guard *poolGuard) grants() (*PoolGrantFile, error) {
 }
 
 func (m *Manager) poolGrants() (*PoolGrantFile, error) {
+	return m.loadPoolGrants(false)
+}
+
+func (m *Manager) loadPoolGrants(readOnly bool) (*PoolGrantFile, error) {
 	guard := m.poolGuard
 	if guard == nil || guard.role != "service" || guard.checkpoint == "" || guard.faulted.Load() {
 		return nil, ErrPoolGuard
@@ -178,8 +182,28 @@ func (m *Manager) poolGrants() (*PoolGrantFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := guard.acceptCheckpoint(record); err != nil {
-		return nil, err
+	if readOnly {
+		// Preflight never advances or synchronizes the journal. A pending
+		// policy refresh fails closed until normal runtime has accepted it.
+		guard.journalMu.Lock()
+		defer guard.journalMu.Unlock()
+		info, err := os.Lstat(guard.checkpoint)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, ErrPoolGuard
+		}
+		file, err := os.Open(guard.checkpoint)
+		if err != nil {
+			return nil, ErrPoolGuard
+		}
+		defer file.Close()
+		floor, _, err := guard.readPoolCheckpoint(file)
+		if err != nil || record.Revision != floor.Revision || poolRecordDigest(record) != floor.Digest || floor.Revision != guard.lastRevision || floor.Digest != guard.lastDigest {
+			return nil, ErrPoolGuard
+		}
+	} else {
+		if err := guard.acceptCheckpoint(record); err != nil {
+			return nil, err
+		}
 	}
 	return record, nil
 }
@@ -269,8 +293,23 @@ func poolRequestCapabilities(req cliproxyexecutor.Request, stream bool) ([]strin
 				if (key == "type" && (child == "tool_use" || child == "tool_result" || child == "function_call" || child == "function_call_output")) || (key == "role" && (child == "tool" || child == "function")) {
 					caps = append(caps, "tools")
 				}
-				if key == "tools" || key == "functions" || key == "tool_calls" || key == "function_call" || key == "tool_use" || key == "tool_result" {
-					caps = append(caps, "tools")
+				switch key {
+				case "tools", "functions", "tool_calls", "function_call", "tool_use", "tool_result", "functionDeclarations", "function_declarations", "functionResponse", "function_response", "allowedFunctionNames", "allowed_function_names":
+					// Empty declarations carry no executable tools. Unknown nonempty
+					// shapes remain tools-bearing rather than bypassing admission.
+					if child != nil && !(key == "function_call" && (child == "none" || child == "auto")) {
+						if declarations, ok := child.([]any); !ok || len(declarations) != 0 {
+							caps = append(caps, "tools")
+						}
+					}
+				case "tool_choice", "functionCall":
+					if child != nil && child != "none" && child != "auto" {
+						caps = append(caps, "tools")
+					}
+				case "functionCallingConfig", "function_calling_config":
+					if config, ok := child.(map[string]any); ok && config["mode"] == "ANY" {
+						caps = append(caps, "tools")
+					}
 				}
 				if key == "image_url" || key == "inlineData" || key == "inline_data" {
 					caps = append(caps, "image_input")

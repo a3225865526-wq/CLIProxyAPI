@@ -1786,7 +1786,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
 		if poolRejected {
-			return nil, nil, &Error{Code: "pool_no_eligible_account", Message: "no pool account admitted for model", HTTPStatus: http.StatusServiceUnavailable}
+			return nil, nil, NewPoolSelectionError()
 		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -2140,7 +2140,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
 		if poolRejected {
-			return nil, nil, "", &Error{Code: "pool_no_eligible_account", Message: "no pool account admitted for model", HTTPStatus: http.StatusServiceUnavailable}
+			return nil, nil, "", NewPoolSelectionError()
 		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
