@@ -44,6 +44,12 @@ var cpaReservedResponseHeaders = map[string]struct{}{
 	"Access-Control-Expose-Headers":    {},
 	"Access-Control-Max-Age":           {},
 	"X-Cpa-Trace-Id":                   {},
+	// Executor provenance (Stage 7.1): the executor-local error-origin
+	// marker. Set only by CPA's own error writers on locally synthesized
+	// exhaustion envelopes; an upstream provider response must never be
+	// able to carry it through forwarding, so it is stripped everywhere
+	// FilterUpstreamHeaders / the addon passthrough run.
+	"X-Cpa-Executor-Error-Origin": {},
 }
 
 // IsCPAReservedResponseHeader reports whether a downstream response header is managed by CPA.

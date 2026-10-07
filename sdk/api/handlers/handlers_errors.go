@@ -18,6 +18,47 @@ func statusFromError(err error) int {
 	return clienterror.HTTPStatusFromError(err)
 }
 
+// ExecutorErrorOriginHeader is the CPA-reserved response header that marks an
+// error envelope as synthesized by this executor itself (Stage 7.1 provenance
+// contract). The body-level error.origin marker is advisory only — a provider
+// can echo it inside a verbatim JSON body — while this transport header is
+// stripped from every forwarded upstream response because it is registered in
+// cpaReservedResponseHeaders. Downstream routers may therefore treat it as
+// the trust root for executor-local pre-dispatch classifications.
+const (
+	ExecutorErrorOriginHeader = "X-Cpa-Executor-Error-Origin"
+	ExecutorErrorOriginLocal  = "local"
+)
+
+// executorExhaustionCodes are the structured coreauth.Error codes the gateway
+// may classify as a safe pre-dispatch pool exhaustion. Only these are ever
+// provenance-stamped; terminal auth errors carry upstream_authentication_required
+// and are deliberately excluded.
+var executorExhaustionCodes = map[string]struct{}{
+	"auth_unavailable": {},
+	"auth_not_found":   {},
+}
+
+// markExecutorLocalErrorOrigin stamps the reserved provenance header when the
+// causal error is an executor-synthesized pool exhaustion. Callers must invoke
+// it before the response status is written. Forwarded provider bodies never
+// reach this path with a structured code, and the reserved-header registry
+// guarantees a provider-supplied header of the same name is stripped from
+// every forwarded response.
+func markExecutorLocalErrorOrigin(c *gin.Context, err error) {
+	if c == nil || err == nil {
+		return
+	}
+	var structuredErr *coreauth.Error
+	if !errors.As(err, &structuredErr) || structuredErr == nil || structuredErr.Code == "" {
+		return
+	}
+	if _, exhausted := executorExhaustionCodes[structuredErr.Code]; !exhausted {
+		return
+	}
+	c.Writer.Header().Set(ExecutorErrorOriginHeader, ExecutorErrorOriginLocal)
+}
+
 func isAuthSelectionUnavailable(err error) bool {
 	type modelCooldownMarker interface {
 		IsModelCooldown() bool
@@ -152,6 +193,12 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		errCause = msg.Error
 	}
 	body := BuildErrorResponseBodyWithError(status, errText, errCause)
+	// Stage 7.1 provenance: stamp the CPA-reserved transport header only on
+	// envelopes this executor synthesized itself carrying one of the two
+	// pool-exhaustion codes. Provider bodies are forwarded verbatim above and
+	// never reach this stamp; the reserved-header registry strips any
+	// provider-supplied header of the same name from every forwarded response.
+	markExecutorLocalErrorOrigin(c, errCause)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {
