@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/stagingdiag"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -259,6 +260,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		Handler: engine,
 	}
 
+	if err := stagingdiag.Start(authManager.RuntimeRetryDiagnostic); err != nil {
+		log.Error("staging diagnostic initialization refused")
+	}
 	return s
 }
 

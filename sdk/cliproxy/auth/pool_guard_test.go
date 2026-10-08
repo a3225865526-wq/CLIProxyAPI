@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,69 @@ type poolProbeExecutor struct {
 	calls   atomic.Int32
 	stream  chan cliproxyexecutor.StreamChunk
 	failure bool
+}
+
+func TestStage74RetryReadsActualManagerAndOverride(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(3, 7*time.Second, 2)
+	m.auths["codex-real-test.json"] = &Auth{ID: "codex-real-test.json", Provider: "codex", Metadata: map[string]any{"type": "codex", "access_token": "stage74-secret-sentinel", "refresh_token": "stage74-secret-sentinel", "request_retry": 1}}
+	value, err := m.RuntimeRetryDiagnostic()
+	if err := err; err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(value)
+	if err := err; err != nil {
+		t.Fatal(err)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(data, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if got := projected["global_request_retry"]; got != float64(3) {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, float64(3))
+	}
+	if got := projected["effective_request_retry"]; got != float64(1) {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, float64(1))
+	}
+	if got := projected["credential_retry_override"]; got != float64(1) {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, float64(1))
+	}
+	if got := projected["max_retry_interval_ms"]; got != float64(7000) {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, float64(7000))
+	}
+	if got := projected["at_most_one_provider_dispatch"]; got != false {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, false)
+	}
+	if strings.Contains(string(data), "stage74-secret-sentinel") {
+		t.Fatal("secret leaked")
+	}
+	m.SetRetryConfig(0, 0, 1)
+	delete(m.auths["codex-real-test.json"].Metadata, "request_retry")
+	value, err = m.RuntimeRetryDiagnostic()
+	if err := err; err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(value)
+	if err := err; err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if got := projected["effective_request_retry"]; got != float64(0) {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, float64(0))
+	}
+	if got := projected["credential_retry_override_present"]; got != false {
+		t.Errorf("unexpected diagnostic result: got %v, want %v", got, false)
+	}
+	if projected["credential_retry_override"] != nil {
+		t.Fatal("unexpected credential retry override")
+	}
+	delete(m.auths, "codex-real-test.json")
+	_, err = m.RuntimeRetryDiagnostic()
+	if err == nil {
+		t.Fatal("expected fail-closed error")
+	}
 }
 
 func (*poolProbeExecutor) PoolDispatchFencing() bool { return true }
