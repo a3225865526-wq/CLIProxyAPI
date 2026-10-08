@@ -89,6 +89,14 @@ func TestStage72ExecutorBridge(t *testing.T) {
 	engine := gin.New()
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, nil)
 	engine.GET("/counts", func(c *gin.Context) { c.JSON(200, gin.H{"provider_calls": calls.Load()}) })
+	engine.POST("/resolution/v1/chat/completions", func(c *gin.Context) {
+		_, _, failure := handler.getRequestDetailsWithOptions("synthetic-unregistered-remediation", false)
+		if failure == nil {
+			c.AbortWithStatus(500)
+			return
+		}
+		handler.WriteErrorResponse(c, failure)
+	})
 	engine.POST("/local/v1/chat/completions", func(c *gin.Context) {
 		handler.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: 503, Error: coreauth.NewPoolSelectionError()})
 	})

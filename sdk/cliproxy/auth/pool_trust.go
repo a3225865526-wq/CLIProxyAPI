@@ -165,11 +165,16 @@ func (m *Manager) PoolPendingIdentities() ([]PoolIdentityExpectation, error) {
 
 // Promotion deliberately names every identity trusted in the new snapshot.
 // Advancing the global authorization version never implicitly reapproves others.
-func (m *Manager) PromotePoolIdentities(ctx context.Context, command PoolPromotion) error {
+func (m *Manager) PromotePoolIdentities(ctx context.Context, command PoolPromotion) (resultErr error) {
 	if m == nil || m.poolGuard == nil || len(command.Identities) == 0 {
 		return ErrPoolGuard
 	}
 	guard := m.poolGuard
+	defer func() {
+		if resultErr == nil {
+			resultErr = m.syncPoolRegistry(ctx)
+		}
+	}()
 	guard.mu.Lock()
 	defer guard.mu.Unlock()
 	if _, err := m.poolGrants(); err != nil {
@@ -180,11 +185,16 @@ func (m *Manager) PromotePoolIdentities(ctx context.Context, command PoolPromoti
 	return m.commitPoolTrust(ctx, command.ExpectedRevision, command.Identities, PoolTrustTrusted)
 }
 
-func (m *Manager) RevokePoolIdentity(ctx context.Context, command PoolRevocation) error {
+func (m *Manager) RevokePoolIdentity(ctx context.Context, command PoolRevocation) (resultErr error) {
 	if m == nil || m.poolGuard == nil {
 		return ErrPoolGuard
 	}
 	guard := m.poolGuard
+	defer func() {
+		if resultErr == nil {
+			resultErr = m.syncPoolRegistry(ctx)
+		}
+	}()
 	guard.mu.Lock()
 	defer guard.mu.Unlock()
 	if _, err := m.poolGrants(); err != nil {

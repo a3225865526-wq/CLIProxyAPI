@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"golang.org/x/net/context"
@@ -190,6 +190,9 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	providers = util.GetProviderName(baseModel)
+	if h != nil && h.AuthManager != nil && h.AuthManager.PoolRole() == "service" {
+		providers = h.AuthManager.PoolModelProviders(baseModel)
+	}
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,
 	// try using the full model name. This handles edge cases where custom models
 	// may be registered with their full suffixed name (e.g., "my-model(8192)").
@@ -197,6 +200,9 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	// custom model registrations that include thinking suffixes.
 	if len(providers) == 0 && baseModel != resolvedModelName {
 		providers = util.GetProviderName(resolvedModelName)
+		if h != nil && h.AuthManager != nil && h.AuthManager.PoolRole() == "service" {
+			providers = h.AuthManager.PoolModelProviders(resolvedModelName)
+		}
 	}
 
 	if len(providers) == 0 {
@@ -214,7 +220,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 		}
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
-			Error:      errors.New(body),
+			Error:      coreauth.NewLocalModelResolutionError(body),
 		}
 	}
 

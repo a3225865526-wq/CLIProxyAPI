@@ -205,7 +205,10 @@ type Manager struct {
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
 	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
-	persistLocks sync.Map
+	persistLocks         sync.Map
+	poolRegistrySync     func(context.Context) error
+	poolRegistrySyncMu   sync.Mutex
+	poolRegistryVersions map[string]poolRegistryVersion
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

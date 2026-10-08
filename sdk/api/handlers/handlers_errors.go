@@ -26,8 +26,10 @@ func statusFromError(err error) int {
 // cpaReservedResponseHeaders. Downstream routers may therefore treat it as
 // the trust root for executor-local pre-dispatch classifications.
 const (
-	ExecutorErrorOriginHeader = "X-Cpa-Executor-Error-Origin"
-	ExecutorErrorOriginLocal  = "local"
+	ExecutorErrorOriginHeader       = "X-Cpa-Executor-Error-Origin"
+	ExecutorErrorOriginLocal        = "local"
+	ExecutorDispatchPhaseHeader     = "X-Cpa-Executor-Dispatch-Phase"
+	ExecutorProviderTransportHeader = "X-Cpa-Executor-Provider-Transport"
 )
 
 // executorExhaustionCodes are the structured coreauth.Error codes the gateway
@@ -47,6 +49,12 @@ var executorExhaustionCodes = map[string]struct{}{
 // every forwarded response.
 func markExecutorLocalErrorOrigin(c *gin.Context, err error) {
 	if c == nil || err == nil || coreauth.IsTerminalAuthError(err) {
+		return
+	}
+	if coreauth.IsLocalModelResolutionError(err) {
+		c.Writer.Header().Set(ExecutorErrorOriginHeader, ExecutorErrorOriginLocal)
+		c.Writer.Header().Set(ExecutorDispatchPhaseHeader, "model_resolution")
+		c.Writer.Header().Set(ExecutorProviderTransportHeader, "not_started")
 		return
 	}
 	if coreauth.IsLocalPoolSelectionError(err) {

@@ -295,6 +295,9 @@ func (b *Builder) Build() (*Service, error) {
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
 	}
+	if coreManager.PoolRole() == "service" {
+		coreManager.SetPoolRegistrySync(service.syncPoolRegistry)
+	}
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
 		api.WithPluginHost(pluginHost),
@@ -303,6 +306,13 @@ func (b *Builder) Build() (*Service, error) {
 		}),
 	)
 	return service, nil
+}
+
+func (s *Service) syncPoolRegistry(ctx context.Context) error {
+	for _, auth := range s.coreManager.List() {
+		s.registerModelsForAuth(ctx, auth)
+	}
+	return nil
 }
 
 func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {

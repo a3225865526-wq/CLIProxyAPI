@@ -520,7 +520,7 @@ func (h *OpenAIResponsesAPIHandler) HandlerType() string {
 func (h *OpenAIResponsesAPIHandler) Models() []map[string]any {
 	// Get dynamic models from the global registry
 	modelRegistry := registry.GetGlobalRegistry()
-	return modelRegistry.GetAvailableModels("openai")
+	return h.FilterPoolModelCatalog(modelRegistry.GetAvailableModels("openai"))
 }
 
 // OpenAIResponsesModels handles the /v1/models endpoint.

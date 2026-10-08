@@ -448,7 +448,15 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		normalizedModels = append(normalizedModels, &clone)
 	}
 	if len(normalizedModels) == 0 {
+		if s.coreManager != nil && s.coreManager.PoolRole() == "service" {
+			s.coreManager.PublishPoolModels(a, providerKey, nil)
+			return
+		}
 		GlobalModelRegistry().UnregisterClient(a.ID)
+		return
+	}
+	if s.coreManager != nil && s.coreManager.PoolRole() == "service" {
+		s.coreManager.PublishPoolModels(a, providerKey, normalizedModels)
 		return
 	}
 	GlobalModelRegistry().RegisterClient(a.ID, providerKey, normalizedModels)

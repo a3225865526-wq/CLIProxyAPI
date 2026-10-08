@@ -49,7 +49,9 @@ var cpaReservedResponseHeaders = map[string]struct{}{
 	// exhaustion envelopes; an upstream provider response must never be
 	// able to carry it through forwarding, so it is stripped everywhere
 	// FilterUpstreamHeaders / the addon passthrough run.
-	"X-Cpa-Executor-Error-Origin": {},
+	"X-Cpa-Executor-Error-Origin":       {},
+	"X-Cpa-Executor-Dispatch-Phase":     {},
+	"X-Cpa-Executor-Provider-Transport": {},
 }
 
 // IsCPAReservedResponseHeader reports whether a downstream response header is managed by CPA.

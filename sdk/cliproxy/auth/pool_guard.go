@@ -94,6 +94,7 @@ type poolGuard struct {
 	leases       map[uint64]*poolLease
 	nextLease    uint64
 	faulted      atomic.Bool
+	now          func() time.Time
 }
 
 func newPoolGuard() *poolGuard {
@@ -237,6 +238,9 @@ func (m *Manager) matchPoolGrantReason(record *PoolGrantFile, auth *Auth, model 
 	const structural = "grant_invalid"
 	digest := PoolCredentialDigest(auth)
 	now := time.Now().Unix()
+	if m.poolGuard.now != nil {
+		now = m.poolGuard.now().Unix()
+	}
 	var match *PoolGrant
 	for i := range record.Grants {
 		grant := &record.Grants[i]

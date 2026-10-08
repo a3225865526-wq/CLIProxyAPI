@@ -29,6 +29,10 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		return
 	}
 	if a.Disabled {
+		if s != nil && s.coreManager != nil && s.coreManager.PoolRole() == "service" {
+			s.coreManager.PublishPoolModels(a, a.Provider, nil)
+			return
+		}
 		if s != nil && s.coreManager != nil {
 			if current, ok := s.coreManager.GetByID(a.ID); ok && current != nil && !current.Disabled {
 				return
@@ -294,6 +298,10 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		key = strings.ToLower(strings.TrimSpace(a.Provider))
 	}
 	models = s.appendPluginModels(key, models)
+	if s.coreManager != nil && s.coreManager.PoolRole() == "service" {
+		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		return
+	}
 	if len(models) > 0 {
 		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		if strings.EqualFold(strings.TrimSpace(a.Provider), "antigravity") {

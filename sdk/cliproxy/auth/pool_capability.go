@@ -184,6 +184,11 @@ func (m *Manager) commitPoolModelCapability(ctx context.Context, command PoolMod
 		return ErrPoolGuard
 	}
 	guard := m.poolGuard
+	defer func() {
+		if resultErr == nil {
+			resultErr = m.syncPoolRegistry(ctx)
+		}
+	}()
 	guard.mu.Lock()
 	defer guard.mu.Unlock()
 	if _, err := m.poolGrants(); err != nil {

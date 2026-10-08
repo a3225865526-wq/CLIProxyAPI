@@ -55,6 +55,9 @@ func (manager *Manager) poolCandidateRejection(auth *Auth, model string, opts cl
 }
 
 func (manager *Manager) poolCandidateRejectionFromRecord(record *PoolGrantFile, auth *Auth, model string, opts cliproxyexecutor.Options) string {
+	if !manager.poolRegistrySupports(auth, model, record) {
+		return "pool_registry_not_current"
+	}
 	caps, err := poolRequestCapabilities(cliproxyexecutor.Request{Payload: opts.OriginalRequest}, opts.Stream)
 	if err != nil {
 		return "request_capability_invalid"
