@@ -1,6 +1,28 @@
 package executor
 
-import "context"
+import (
+	"context"
+	"net/http"
+)
+
+func LocalAccountUnavailable(ctx context.Context) error {
+	if guard, ok := ctx.Value(dispatchGuardKey{}).(interface{ LocalAccountUnavailable() error }); ok {
+		return guard.LocalAccountUnavailable()
+	}
+	return context.Canceled
+}
+
+func ResponsesSSE(ctx context.Context) bool {
+	guard, ok := ctx.Value(dispatchGuardKey{}).(interface{ ResponsesSSE() bool })
+	return ok && guard.ResponsesSSE()
+}
+
+func PersistResponsesSSEEvent(ctx context.Context, payload []byte) error {
+	if guard, ok := ctx.Value(dispatchGuardKey{}).(interface{ PersistResponsesSSEEvent([]byte) error }); ok {
+		return guard.PersistResponsesSSEEvent(payload)
+	}
+	return nil
+}
 
 type dispatchGuardKey struct{}
 
@@ -8,11 +30,15 @@ type dispatchGuardKey struct{}
 // Its linearization point precedes network I/O; it cannot certify remote receipt.
 type DispatchGuard interface{ AuthorizeDispatch() error }
 
+// DispatchObserver records the point immediately before transport I/O. The
+// observer may fail closed; callers must not send after that failure.
+type DispatchObserver interface{ UpstreamDispatchStarted() error }
+
 func WithDispatchGuard(ctx context.Context, guard DispatchGuard) context.Context {
 	return context.WithValue(ctx, dispatchGuardKey{}, guard)
 }
 
-func BeforeUpstreamDispatch(ctx context.Context) error {
+func BeforeUpstreamDispatch(ctx context.Context, request ...*http.Request) error {
 	if ctx == nil {
 		return nil
 	}
@@ -20,7 +46,26 @@ func BeforeUpstreamDispatch(ctx context.Context) error {
 		return context.Cause(ctx)
 	}
 	if guard, ok := ctx.Value(dispatchGuardKey{}).(DispatchGuard); ok {
+		if len(request) != 0 {
+			if validator, ok := guard.(interface{ ValidateDispatchProtocol(*http.Request) error }); ok {
+				if err := validator.ValidateDispatchProtocol(request[0]); err != nil {
+					return err
+				}
+			}
+		}
 		return guard.AuthorizeDispatch()
+	}
+	return nil
+}
+
+// MarkUpstreamDispatchStarted records the trusted transport boundary, after
+// authorization and immediately before the underlying network operation.
+func MarkUpstreamDispatchStarted(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if observer, ok := ctx.Value(dispatchGuardKey{}).(DispatchObserver); ok {
+		return observer.UpstreamDispatchStarted()
 	}
 	return nil
 }

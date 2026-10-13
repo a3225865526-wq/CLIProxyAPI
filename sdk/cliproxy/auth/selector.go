@@ -824,7 +824,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
+	if auth.Disabled || ManagementIsolation(auth) || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if hasUnauthorizedAuthFailure(auth) {

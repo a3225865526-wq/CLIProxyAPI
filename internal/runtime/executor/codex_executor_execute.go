@@ -28,6 +28,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return e.executeOpenAIImage(ctx, auth, req, opts)
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	if !opts.Stream && auth != nil {
+		var finishTransport func()
+		ctx, finishTransport = helps.PG02TransportContext(ctx, opts.Headers, baseModel, auth.ID, auth.Generation)
+		defer finishTransport()
+	}
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {

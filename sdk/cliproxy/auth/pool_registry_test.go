@@ -32,6 +32,56 @@ func assertPoolRegistryParity(t *testing.T, m *Manager, eligible bool) {
 		t.Fatalf("preflight=%+v providers=%v eligible=%t", p, m.PoolModelProviders("synthetic-native"), eligible)
 	}
 }
+func TestPoolRegistryMarkResultKeepsPublicationCurrent(t *testing.T) {
+	m, _, a, _, _ := poolGuardFixture(t, "service")
+	installPoolRegistryFixture(t, m)
+	explicitPoolPromotion(t, m)
+	assertPoolRegistryParity(t, m, true)
+	before, _ := m.GetByID(a.ID)
+	m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: a.Provider, Model: "synthetic-native", Success: true})
+	after, _ := m.GetByID(a.ID)
+	if after.Generation != before.Generation+1 {
+		t.Fatalf("generation=%d, want %d", after.Generation, before.Generation+1)
+	}
+	assertPoolRegistryParity(t, m, true)
+	for range 3 {
+		m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: a.Provider, Model: "synthetic-native", Success: true})
+		assertPoolRegistryParity(t, m, true)
+	}
+	if m.PublishPoolModels(before, a.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}}) {
+		t.Fatal("old result snapshot published")
+	}
+	rev, identity := poolExpectation(t, m)
+	if err := m.RevokePoolModelCapability(context.Background(), PoolModelRevoke{ExpectedRevision: rev, Identity: identity, Model: "synthetic-native"}); err != nil {
+		t.Fatal(err)
+	}
+	m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: a.Provider, Model: "synthetic-native", Success: true})
+	assertPoolRegistryParity(t, m, false)
+}
+
+func TestPoolRegistryMarkResultConcurrentRevoke(t *testing.T) {
+	m, _, a, _, _ := poolGuardFixture(t, "service")
+	installPoolRegistryFixture(t, m)
+	explicitPoolPromotion(t, m)
+	old, _ := m.GetByID(a.ID)
+	rev, identity := poolExpectation(t, m)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 30 {
+			m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: a.Provider, Model: "synthetic-native", Success: true})
+		}
+	})
+	err := m.RevokePoolModelCapability(context.Background(), PoolModelRevoke{ExpectedRevision: rev, Identity: identity, Model: "synthetic-native"})
+	wg.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.PublishPoolModels(old, a.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}})
+	assertPoolRegistryParity(t, m, false)
+	if len(registry.GetGlobalRegistry().GetModelsForClient(a.ID)) != 0 {
+		t.Fatal("result publication restored revoked model")
+	}
+}
 func TestPoolRegistryLifecycle(t *testing.T) {
 	m, probe, a, _, _ := poolGuardFixture(t, "service")
 	registry.GetGlobalRegistry().UnregisterClient(a.ID)

@@ -153,6 +153,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
 	if errFence := cliproxyexecutor.BeforeUpstreamDispatch(ctx); errFence != nil {
+		sess.clearActive(conn, readCh)
+		if isEphemeralSession {
+			closeCodexWebsocketSession(sess, "dispatch_rejected")
+		}
 		unlockStreamSession()
 		return nil, errFence
 	}
@@ -161,6 +165,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		// A failed write may already have reached upstream. Never replay it.
 		e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+		sess.clearActive(conn, readCh)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		unlockStreamSession()
 		return nil, errSend

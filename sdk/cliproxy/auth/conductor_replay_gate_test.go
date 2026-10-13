@@ -13,11 +13,20 @@ import (
 
 // PG-06 regression harness: a pool request that was actually dispatched to an
 // upstream account must never be transparently replayed on another credential
-// unless the upstream returned a definitive pre-execution rejection (4xx).
+// based on a response status. Typed pre-dispatch failures remain distinct.
 // Non-pool traffic keeps its established failover contract.
 
 func poolAttemptTestContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, poolAttemptContextKey{}, &atomicPoolAttempt{})
+}
+
+func TestIntegrationDispatched400WithoutProofStopsReplay(t *testing.T) {
+	ctx := newUpstreamAttemptContext(poolAttemptTestContext(context.Background()))
+	cliproxyexecutor.MarkUpstreamAttempt(ctx)
+	cause := &Error{HTTPStatus: http.StatusBadRequest, Message: "synthetic response with unknown provider work"}
+	if !mustStopReplayAfterDispatch(ctx, "codex", cause) {
+		t.Fatalf("dispatched HTTP 400 without no-work proof was classified replay-safe: definitive=%v attempted=%v work_observed=%v", definitiveUpstreamRejection(cause), cliproxyexecutor.UpstreamAttempted(ctx), cliproxyexecutor.UpstreamWorkObserved(ctx))
+	}
 }
 
 func registerReplayGateAccounts(t *testing.T, m *Manager, provider, firstID, secondID string) {
@@ -62,7 +71,7 @@ func TestManagerExecutePoolNoReplayAfterDispatchedTransportFailure(t *testing.T)
 	}
 }
 
-func TestManagerExecutePoolFailoverAfterDefinitiveRejection(t *testing.T) {
+func TestManagerExecutePoolNoReplayAfterDispatchedStatusRejection(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.SetRetryConfig(3, 30*time.Second, 0)
 	firstID, secondID := "replay-first-reject", "replay-second-reject"
@@ -81,15 +90,12 @@ func TestManagerExecutePoolFailoverAfterDefinitiveRejection(t *testing.T) {
 		},
 	})
 
-	response, errExecute := manager.Execute(poolAttemptTestContext(context.Background()), []string{"codex"}, cliproxyexecutor.Request{Model: "replay-model"}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("definitive 4xx rejection may fail over, got error: %v", errExecute)
+	_, errExecute := manager.Execute(poolAttemptTestContext(context.Background()), []string{"codex"}, cliproxyexecutor.Request{Model: "replay-model"}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("dispatched status rejection must not be transparently replayed")
 	}
-	if len(attempts) != 2 || attempts[0] != firstID || attempts[1] != secondID {
-		t.Fatalf("attempts = %v, want rejected account then healthy account", attempts)
-	}
-	if string(response.Payload) != secondID {
-		t.Fatalf("response = %s, want healthy account payload", response.Payload)
+	if len(attempts) != 1 || attempts[0] != firstID {
+		t.Fatalf("attempts = %v, want exactly the dispatched account", attempts)
 	}
 }
 
@@ -122,6 +128,168 @@ func TestManagerExecutePoolFailoverBeforeDispatch(t *testing.T) {
 	}
 	if string(response.Payload) != secondID {
 		t.Fatalf("response = %s, want healthy account payload", response.Payload)
+	}
+}
+
+func TestReplayGatePoolDispatchClassification(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(context.Context) error
+		wantStop   bool
+		wantStatus int
+	}{
+		{
+			name: "ordinary 400 without proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusBadRequest, Message: "provider rejected request"}
+			},
+			wantStop: true,
+		},
+		{
+			name: "model_not_found body is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusBadRequest, Message: `{"error":{"code":"model_not_found"}}`}
+			},
+			wantStop: true,
+		},
+		{
+			name: "damaged body is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusBadRequest, Message: "not json"}
+			},
+			wantStop: true,
+		},
+		{
+			name: "wrapped 400 is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return WithCause(&Error{HTTPStatus: http.StatusBadRequest, Message: "wrapped"}, errors.New("transport wrapper"))
+			},
+			wantStop: true,
+		},
+		{
+			name: "started without status is unknown",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return errors.New("provider result unknown")
+			},
+			wantStop: true,
+		},
+		{
+			name: "unknown wrapped attempt stops",
+			prepare: func(ctx context.Context) error {
+				return markUpstreamExecutionAttempt(errors.New("wrapped provider result unknown"))
+			},
+			wantStop: true,
+		},
+		{
+			name: "not started local rejection may replay",
+			prepare: func(context.Context) error {
+				return NewLocalModelResolutionError(`{"error":{"code":"model_not_found"}}`)
+			},
+			wantStop: false,
+		},
+		{
+			name: "local typed error cannot mask started work",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return NewLocalModelResolutionError(`{"error":{"code":"model_not_found"}}`)
+			},
+			wantStop: true,
+		},
+		{
+			name: "remapped 403 wrapper cannot authorize replay",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return WithCause(&Error{HTTPStatus: 403, Message: "remapped"}, &Error{HTTPStatus: 400, Message: "original"})
+			},
+			wantStop: true,
+		},
+		{
+			name: "output or usage observed stops replay",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamWork(ctx)
+				return &Error{HTTPStatus: 429, Message: "after output"}
+			},
+			wantStop: true,
+		},
+		{
+			name: "401 after dispatch is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired"}
+			},
+			wantStop:   true,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "403 after dispatch is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusForbidden, Message: "forbidden"}
+			},
+			wantStop:   true,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "404 after dispatch is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusNotFound, Message: "missing"}
+			},
+			wantStop:   true,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "429 after dispatch is not proof",
+			prepare: func(ctx context.Context) error {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"}
+			},
+			wantStop:   true,
+			wantStatus: http.StatusTooManyRequests,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := newUpstreamAttemptContext(poolAttemptTestContext(context.Background()))
+			err := test.prepare(ctx)
+			if got := mustStopReplayAfterDispatch(ctx, "codex", err); got != test.wantStop {
+				t.Fatalf("mustStopReplayAfterDispatch() = %v, want %v", got, test.wantStop)
+			}
+			if test.wantStatus != 0 && statusCodeFromError(err) != test.wantStatus {
+				t.Fatalf("statusCodeFromError() = %d, want %d", statusCodeFromError(err), test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestManagerExecutePoolNoReplayAfterDispatched400WithoutProof(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetRetryConfig(3, 30*time.Second, 0)
+	firstID, secondID := "replay-first-400", "replay-second-400"
+	registerReplayGateAccounts(t, manager, "codex", firstID, secondID)
+
+	attempts := make([]string, 0, 2)
+	manager.RegisterExecutor(&mockCustomErrorExecutor{
+		identifier: "codex",
+		executeFn: func(ctx context.Context, selected *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			attempts = append(attempts, selected.ID)
+			cliproxyexecutor.MarkUpstreamAttempt(ctx)
+			return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusBadRequest, Message: "ordinary provider 400"}
+		},
+	})
+
+	_, errExecute := manager.Execute(poolAttemptTestContext(context.Background()), []string{"codex"}, cliproxyexecutor.Request{Model: "replay-model"}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("dispatched ordinary 400 must not be transparently replayed")
+	}
+	if len(attempts) != 1 || attempts[0] != firstID {
+		t.Fatalf("attempts = %v, want exactly the first dispatched account", attempts)
 	}
 }
 

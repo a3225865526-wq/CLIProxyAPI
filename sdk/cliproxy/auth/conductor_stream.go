@@ -206,6 +206,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 }
 
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool) (*cliproxyexecutor.StreamResult, error) {
+	ctx = poolObservationContext(ctx, opts)
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -242,6 +243,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		startStream := time.Now()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
+		if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) && errStream != nil {
+			return nil, errStream
+		}
 		if errStream != nil && mustStopReplayAfterDispatch(ctx, provider, errStream) {
 			return nil, wrapRequestStopError(errStream)
 		}

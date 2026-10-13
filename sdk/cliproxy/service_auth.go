@@ -374,7 +374,13 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 			}
 		}
 		op = "update"
-		_, err = s.coreManager.Update(ctx, auth)
+		// The manager may discard an obsolete watcher isolation snapshot after
+		// verifying a later recovery commit. Publish its accepted runtime snapshot.
+		var accepted *coreauth.Auth
+		accepted, err = s.coreManager.Update(ctx, auth)
+		if err == nil && accepted != nil {
+			auth = accepted
+		}
 	} else {
 		_, err = s.coreManager.Register(ctx, auth)
 	}

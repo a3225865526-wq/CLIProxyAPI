@@ -14,7 +14,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 type stage72ManagementExecutor struct{ refreshRecordExecutor }
@@ -50,6 +52,16 @@ func TestPoolStage3ManagementAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewHandler(cfg, "", manager)
+	// Wire the host publication callback as the production Service Builder does.
+	manager.SetPoolRegistrySync(func(context.Context) error {
+		for _, current := range manager.List() {
+			if !manager.PublishPoolModels(current, current.Provider, []*registry.ModelInfo{{ID: "synthetic-native"}}) {
+				return coreauth.ErrPoolGuard
+			}
+		}
+		return nil
+	})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 	engine := gin.New()
 	engine.GET("/models", handler.GetPoolModels)
 	engine.POST("/models/grant", handler.GrantPoolModel)
@@ -131,6 +143,13 @@ func TestPoolStage3ManagementAPI(t *testing.T) {
 	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/models/revoke", bytes.NewReader(revoke)))
 	if response.Code != http.StatusOK {
 		t.Fatal("revoke failed", response.Body.String())
+	}
+	if len(registry.GetGlobalRegistry().GetModelsForClient(auth.ID)) != 0 {
+		t.Fatal("revoke returned success before registry removal")
+	}
+	preflight, err := manager.PoolRequestPreflight(context.Background(), "synthetic-native", cliproxyexecutor.Options{})
+	if err != nil || preflight.EligibleCount != 0 || len(manager.PoolModelProviders("synthetic-native")) != 0 {
+		t.Fatal("revoked model remained eligible", preflight, err)
 	}
 	for _, body := range []string{string(grant) + ` {}`, `{"expected_revision":4,"unknown":true}`, string(grant) + strings.Repeat(" ", 64*1024) + "{}"} {
 		response = httptest.NewRecorder()

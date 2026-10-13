@@ -595,8 +595,11 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		return
 	}
 
-	rawJSON = h.prepareCodexMultiAgentV2Tools(c, rawJSON)
-	rawJSON = h.prepareCodexOrphanDelegation(c, rawJSON)
+	poolSSE := h.AuthManager != nil && h.AuthManager.AccountPoolGuarded() && gjson.GetBytes(rawJSON, "stream").Type == gjson.True
+	if !poolSSE {
+		rawJSON = h.prepareCodexMultiAgentV2Tools(c, rawJSON)
+		rawJSON = h.prepareCodexOrphanDelegation(c, rawJSON)
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")

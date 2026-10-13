@@ -292,6 +292,9 @@ func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.H
 		if headers.Get("X-Codex-Metering") == "v1" {
 			result.Set("X-Codex-Metering", "v1")
 		}
+		if value := headers.Get("X-ClearAPI-PG02-Receipt"); value != "" {
+			result.Set("X-ClearAPI-PG02-Receipt", value)
+		}
 		return result
 	}
 	return FilterUpstreamHeaders(headers)
@@ -307,6 +310,12 @@ func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrou
 			result = make(http.Header)
 		}
 		result.Set("X-Codex-Metering", "v1")
+	}
+	if value := baseRaw.Get("X-ClearAPI-PG02-Receipt"); value != "" {
+		if result == nil {
+			result = make(http.Header)
+		}
+		result.Set("X-ClearAPI-PG02-Receipt", value)
 	}
 	return result
 }

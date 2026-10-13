@@ -33,6 +33,25 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestResponsesWebsocketC4PoolRejectsBeforeUpgrade(t *testing.T) {
+	t.Setenv("CLEARAPI_POOL_ROLE", "service")
+	manager := coreauth.NewManager(nil, nil, nil)
+	probe := &homeResponsesWebsocketExecutor{}
+	manager.RegisterExecutor(probe)
+	handler := NewOpenAIResponsesAPIHandler(&handlers.BaseAPIHandler{AuthManager: manager})
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	c.Request.Header.Set("Upgrade", "websocket")
+	c.Request.Header.Set("Connection", "Upgrade")
+	c.Request.Header.Set("Sec-WebSocket-Version", "13")
+	c.Request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	handler.ResponsesWebsocket(c)
+	if response.Code != http.StatusForbidden || probe.calls.Load() != 0 || !strings.Contains(response.Body.String(), `"codex_upstream_dispatched":false`) {
+		t.Fatal("pool websocket was not rejected before upgrade", response.Code, response.Body.String(), probe.calls.Load())
+	}
+}
+
 type homeResponsesWebsocketDispatcher struct {
 	calls atomic.Int32
 }

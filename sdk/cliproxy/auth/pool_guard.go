@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,12 +11,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
@@ -95,6 +100,8 @@ type poolGuard struct {
 	nextLease    uint64
 	faulted      atomic.Bool
 	now          func() time.Time
+	receipts     *receiptWriter
+	receiptErr   error
 }
 
 func newPoolGuard() *poolGuard {
@@ -102,7 +109,8 @@ func newPoolGuard() *poolGuard {
 	if role == "" {
 		return nil
 	}
-	return &poolGuard{role: role, file: os.Getenv("CLEARAPI_POOL_ADMISSION_FILE"), executorID: strings.TrimSpace(os.Getenv("CLEARAPI_POOL_EXECUTOR_ID")), checkpoint: os.Getenv("CLEARAPI_POOL_CHECKPOINT_FILE"), counts: make(map[string]int)}
+	receipts, receiptErr := newReceiptWriter()
+	return &poolGuard{role: role, file: os.Getenv("CLEARAPI_POOL_ADMISSION_FILE"), executorID: strings.TrimSpace(os.Getenv("CLEARAPI_POOL_EXECUTOR_ID")), checkpoint: os.Getenv("CLEARAPI_POOL_CHECKPOINT_FILE"), counts: make(map[string]int), receipts: receipts, receiptErr: receiptErr}
 }
 
 func (m *Manager) PoolRole() string {
@@ -214,7 +222,7 @@ func (m *Manager) poolGrant(auth *Auth, model string, capabilities []string) (*P
 	if guard == nil {
 		return nil, nil
 	}
-	if guard.role != "service" || auth == nil || auth.AuthKind() != AuthKindOAuth || auth.Disabled || auth.Status == StatusDisabled || auth.Unavailable {
+	if guard.role != "service" || auth == nil || auth.AuthKind() != AuthKindOAuth || auth.Disabled || ManagementIsolation(auth) || auth.Status == StatusDisabled || auth.Unavailable {
 		return nil, ErrPoolGuard
 	}
 	record, err := m.poolGrants()
@@ -361,6 +369,18 @@ func (executor *poolExecutor) PrepareRequest(*http.Request, *Auth) error {
 
 func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, consumeAttempt bool) (*poolLease, error) {
 	guard := executor.manager.poolGuard
+	if guard.receiptErr != nil {
+		return nil, ErrPoolGuard
+	}
+	if !poolProtocolAdmitted(ctx, opts, stream) {
+		return nil, ErrPoolGuard
+	}
+	if stream && guard.receipts == nil {
+		return nil, ErrPoolGuard
+	}
+	if guard.receipts != nil && (guard.receipts.faulted.Load() || !consumeAttempt) {
+		return nil, ErrPoolGuard
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -382,7 +402,7 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	}
 	executor.manager.mu.RLock()
 	current := executor.manager.auths[auth.ID]
-	currentMatches := current != nil && !current.Disabled && current.Status != StatusDisabled && !current.Unavailable && PoolCredentialDigest(current) == PoolCredentialDigest(auth)
+	currentMatches := current != nil && !current.Disabled && !ManagementIsolation(current) && current.Status != StatusDisabled && !current.Unavailable && PoolCredentialDigest(current) == PoolCredentialDigest(auth)
 	executor.manager.mu.RUnlock()
 	if !currentMatches {
 		return nil, ErrPoolGuard
@@ -411,9 +431,18 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	if trust.State != PoolTrustTrusted || trust.AuthorizationVersion != record.Revision {
 		return nil, ErrPoolGuard
 	}
+	if stream && guard.receipts != nil {
+		id := poolCapacityReceiptID(opts.Headers.Get("X-ClearAPI-PG02-Request"), opts.Headers.Get("X-ClearAPI-PG02-Attempt"))
+		if exists, err := guard.receipts.receiptExists(id); err != nil || exists {
+			return nil, ErrPoolGuard
+		}
+	}
 	guard.countsMu.Lock()
 	defer guard.countsMu.Unlock()
 	if guard.counts[auth.ID] >= grant.MaxConcurrency {
+		if stream && consumeAttempt {
+			return nil, executor.capacityRejection(ctx, auth, req, opts, trust, record)
+		}
 		return nil, ErrPoolGuard
 	}
 	poolLogModelDecision(ctx, auth, requestedModelFromOptions(opts), req.Model, true, "", record.Revision, trust.Generation)
@@ -423,10 +452,68 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	if cause := context.Cause(ctx); cause != nil {
 		return nil, cause
 	}
-	child, cancel := context.WithCancelCause(ctx)
+	parent := ctx
+	persistent := stream && cliproxyexecutor.DownstreamWebsocket(ctx) && poolExecutionSessionID(opts) != ""
+	if persistent {
+		// The request context owns the active turn; the retained lifecycle owns
+		// the idle socket. Keep values (including the one-shot attempt budget).
+		parent = context.WithoutCancel(ctx)
+	}
+	child, cancel := context.WithCancelCause(parent)
 	guard.nextLease++
-	lease := &poolLease{PoolInFlight: PoolInFlight{RequestID: guard.nextLease, AuthID: auth.ID, Provider: auth.Provider, ExecutorID: guard.executorID, CredentialDigest: PoolCredentialDigest(auth), AuthorizationVersion: trust.AuthorizationVersion, Generation: trust.Generation}, manager: executor.manager, auth: auth.Clone(), req: req, caps: caps, requestedModel: requestedModelFromOptions(opts), ctx: child, cancel: cancel, consumeAttempt: consumeAttempt}
+	attemptID := ""
+	receiptRequestID := ""
+	if guard.receipts != nil && opts.Headers != nil {
+		attemptID = strings.TrimSpace(opts.Headers.Get("X-ClearAPI-PG02-Attempt"))
+		receiptRequestID = strings.TrimSpace(opts.Headers.Get("X-ClearAPI-PG02-Request"))
+	}
+	if receiptRequestID == "" {
+		receiptRequestID = internallogging.GetRequestID(ctx)
+	}
+	if !validReceiptID(receiptRequestID) {
+		receiptRequestID = "pool-" + strconv.FormatUint(guard.nextLease, 10)
+	}
+	if guard.receipts != nil && attemptID != "" && !validReceiptID(attemptID) {
+		cancel(ErrPoolGuard)
+		return nil, ErrPoolGuard
+	}
+	if stream && (!validReceiptID(attemptID) || !validReceiptID(receiptRequestID)) {
+		cancel(ErrPoolGuard)
+		return nil, ErrPoolGuard
+	}
+	lease := &poolLease{PoolInFlight: PoolInFlight{RequestID: guard.nextLease, AuthID: auth.ID, Provider: auth.Provider, ExecutorID: guard.executorID, CredentialDigest: PoolCredentialDigest(auth), AuthorizationVersion: trust.AuthorizationVersion, Generation: trust.Generation}, manager: executor.manager, auth: auth.Clone(), req: req, caps: caps, requestedModel: requestedModelFromOptions(opts), attemptID: attemptID, sessionID: poolExecutionSessionID(opts), ctx: child, cancel: cancel, consumeAttempt: consumeAttempt, persistent: persistent, receiptID: uuid.NewString(), receiptState: "NOT_STARTED", receiptRequestID: receiptRequestID}
 	lease.ctx = usage.WithCodexMeteringObserver(cliproxyexecutor.WithDispatchGuard(child, lease), lease.observeMetering)
+	// Keep private admission evidence independent of provider mutations.
+	admission := opts
+	admission.OriginalRequest = append([]byte(nil), opts.OriginalRequest...)
+	admission.Headers = opts.Headers.Clone()
+	admission.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: opts.Metadata[cliproxyexecutor.RequestPathMetadataKey]}
+	lease.protocolAdmitted = func() bool { return poolProtocolAdmitted(ctx, admission, stream) }
+	lease.receiptSSE = stream
+	if stream {
+		if proof, ok := ctx.Value(poolSSEFallbackContextKey{}).(*poolSSEZeroDispatchError); ok {
+			accountRef := sha256.Sum256([]byte(auth.ID))
+			if proof.final.RequestID != receiptRequestID || proof.final.AttemptID != attemptID || proof.final.CanonicalModel != req.Model || proof.final.AccountRef == hex.EncodeToString(accountRef[:]) {
+				cancel(ErrPoolGuard)
+				return nil, ErrPoolGuard
+			}
+			if err := guard.receipts.verifyZeroDispatchParent(proof.final); err != nil {
+				cancel(ErrPoolGuard)
+				return nil, ErrPoolGuard
+			}
+			lease.previousReceiptID = proof.final.ReceiptID
+		}
+		// Durable identity prevents replay across process restarts. B still
+		// shares the one-shot dispatch budget, with its own account receipt.
+		digest := sha256.Sum256([]byte(receiptRequestID + "\n" + attemptID + "\n" + auth.ID))
+		lease.receiptID = hex.EncodeToString(digest[:])
+	}
+	if guard.receipts != nil {
+		if err := guard.receipts.begin(lease); err != nil {
+			cancel(ErrPoolGuard)
+			return nil, ErrPoolGuard
+		}
+	}
 	lease.stopClose = context.AfterFunc(child, lease.closeResource)
 	if guard.leases == nil {
 		guard.leases = make(map[uint64]*poolLease)
@@ -436,6 +523,13 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	return lease, nil
 }
 
+func poolExecutionSessionID(opts cliproxyexecutor.Options) string {
+	if opts.Metadata == nil {
+		return ""
+	}
+	value, _ := opts.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string)
+	return strings.TrimSpace(value)
+}
 func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	lease, err := executor.begin(ctx, auth, req, opts, false, true)
 	if err != nil {
@@ -517,6 +611,12 @@ func (executor *poolExecutor) ExecuteStream(ctx context.Context, auth *Auth, req
 		}
 	}()
 	handedOff = true
+	if lease.receiptSSE {
+		if upstream.Headers == nil {
+			upstream.Headers = make(http.Header)
+		}
+		upstream.Headers.Set("X-ClearAPI-PG02-Receipt", lease.receiptID)
+	}
 	return &cliproxyexecutor.StreamResult{Headers: upstream.Headers, Chunks: chunks}, nil
 }
 

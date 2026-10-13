@@ -24,6 +24,9 @@ import (
 
 func codexPoolFixture(t *testing.T, baseURL string, ws bool) (*coreauth.Manager, *coreauth.Auth) {
 	t.Helper()
+	if os.Getenv("CLEARAPI_PG02_RESPONSES_SSE") != "true" {
+		t.Setenv("CLEARAPI_PG02_HTTP_NON_STREAM", "true")
+	}
 	root := t.TempDir()
 	dir := filepath.Join(root, "auths")
 	if os.Mkdir(dir, 0700) != nil {

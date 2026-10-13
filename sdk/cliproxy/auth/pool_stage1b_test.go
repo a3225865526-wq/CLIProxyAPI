@@ -3,8 +3,12 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +20,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type poolFailingStore struct{}
@@ -351,10 +356,10 @@ func TestPoolStage1BConcurrentPromotionReplacementAndRevoke(t *testing.T) {
 			})
 			group.Go(func() {
 				<-start
-					if scenario == "replace" {
-						auth.Metadata["account_id"] = "synthetic-account-id-replaced"
-						_, _ = m.Update(context.Background(), auth)
-					} else {
+				if scenario == "replace" {
+					auth.Metadata["account_id"] = "synthetic-account-id-replaced"
+					_, _ = m.Update(context.Background(), auth)
+				} else {
 					// A stale revoke may lose CAS. A fresh security revoke must then win.
 					_ = m.RevokePoolIdentity(context.Background(), PoolRevocation{ExpectedRevision: revision, Identity: identity})
 				}
@@ -494,11 +499,25 @@ func TestPoolStage1BLeaseDispatchAndTermination(t *testing.T) {
 }
 
 func TestPoolStage1BStreamRevokeTerminatesAndDoesNotReplay(t *testing.T) {
+	// HTTP pool streams now require the explicit SSE scope and durable identity.
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(receiptDirEnv, dir)
+	t.Setenv("CLEARAPI_PG02_RESPONSES_SSE", "true")
+	t.Setenv("CLEARAPI_PG02_PROCESS_EPOCH", "00112233445566778899aabbccddeeff")
+	t.Setenv("CLEARAPI_PG02_GATEWAY_PROOF_KEY", "synthetic-proof-key-for-local-unit-tests-only")
 	m, probe, _, _, _ := poolGuardFixture(t, "service")
 	m.SetRetryConfig(3, 0, 3)
 	probe.stream = make(chan cliproxyexecutor.StreamChunk, 1)
 	probe.stream <- cliproxyexecutor.StreamChunk{Payload: []byte("data: synthetic\n\n")}
-	result, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{Stream: true})
+	opts := cliproxyexecutor.Options{Stream: true, SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: []byte(`{"stream":true}`), Metadata: map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/responses"}, Headers: http.Header{"X-Clearapi-Pg02-Attempt": []string{"revoke-attempt"}, "X-Clearapi-Pg02-Request": []string{"revoke-request"}}}
+	mac := hmac.New(sha256.New, []byte(os.Getenv("CLEARAPI_PG02_GATEWAY_PROOF_KEY")))
+	mac.Write([]byte("revoke-request\nrevoke-attempt\nPOST\n/v1/responses\n"))
+	mac.Write(opts.OriginalRequest)
+	opts.Headers.Set("X-ClearAPI-PG02-Gateway-Proof", hex.EncodeToString(mac.Sum(nil)))
+	result, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native"}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

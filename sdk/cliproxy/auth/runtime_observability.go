@@ -39,26 +39,33 @@ func (m *Manager) RuntimeRetryDiagnostic() (any, error) {
 	if overridePresent {
 		overrideValue = &override
 	}
+	var receiptIdentity map[string]any
+	if m.poolGuard != nil && m.poolGuard.receipts != nil {
+		writer := m.poolGuard.receipts
+		receiptIdentity = map[string]any{"process_epoch": writer.processEpoch, "process_id": writer.processID, "process_start_ticks": writer.startTicks, "executor_binary_sha256": writer.binarySHA}
+	}
 	return struct {
-		AuthID                    string `json:"auth_id"`
-		Model                     string `json:"model"`
-		GlobalRetry               int    `json:"global_request_retry"`
-		MaxRetryCredentials       int    `json:"max_retry_credentials"`
-		MaxRetryIntervalMS        int64  `json:"max_retry_interval_ms"`
-		CredentialOverridePresent bool   `json:"credential_retry_override_present"`
-		CredentialOverride        *int   `json:"credential_retry_override"`
-		EffectiveRequestRetry     int    `json:"effective_request_retry"`
-		PoolRole                  string `json:"pool_role"`
-		HomeEnabled               bool   `json:"home_enabled"`
-		PluginScheduler           bool   `json:"plugin_scheduler_enabled"`
-		ExecutorType              string `json:"registered_executor"`
-		PoolWrapped               bool   `json:"pool_wrapped"`
-		DispatchFence             bool   `json:"dispatch_fence"`
-		HTTPNonStream             bool   `json:"http_nonstream_uses_http_executor"`
-		RouterRetryPolicy         string `json:"router_retry_policy"`
-		FailoverBoundary          string `json:"retry_failover_boundary"`
-		AtMostOneDispatch         bool   `json:"at_most_one_provider_dispatch"`
+		AuthID                    string         `json:"auth_id"`
+		Model                     string         `json:"model"`
+		GlobalRetry               int            `json:"global_request_retry"`
+		MaxRetryCredentials       int            `json:"max_retry_credentials"`
+		MaxRetryIntervalMS        int64          `json:"max_retry_interval_ms"`
+		CredentialOverridePresent bool           `json:"credential_retry_override_present"`
+		CredentialOverride        *int           `json:"credential_retry_override"`
+		EffectiveRequestRetry     int            `json:"effective_request_retry"`
+		PoolRole                  string         `json:"pool_role"`
+		HomeEnabled               bool           `json:"home_enabled"`
+		PluginScheduler           bool           `json:"plugin_scheduler_enabled"`
+		ExecutorType              string         `json:"registered_executor"`
+		PoolWrapped               bool           `json:"pool_wrapped"`
+		DispatchFence             bool           `json:"dispatch_fence"`
+		HTTPNonStream             bool           `json:"http_nonstream_uses_http_executor"`
+		RouterRetryPolicy         string         `json:"router_retry_policy"`
+		FailoverBoundary          string         `json:"retry_failover_boundary"`
+		AtMostOneDispatch         bool           `json:"at_most_one_provider_dispatch"`
+		ReceiptIdentity           map[string]any `json:"transport_receipt_identity,omitempty"`
+		PoolObservation           any            `json:"pool_observation,omitempty"`
 	}{"codex-real-test.json", "gpt-5.6-luna", global, credentials, interval.Milliseconds(), overridePresent, overrideValue, effective, role, home, plugins, executorType, wrappedOK, fenced, knownHTTP,
 		"single Manager.Execute invocation; websocket bootstrap retries do not apply to HTTP non-stream",
-		"pool atomic attempt budget consumed at transport boundary; pre-dispatch failover allowed; second provider dispatch refused", protected}, nil
+		"pool atomic attempt budget consumed at transport boundary; pre-dispatch failover allowed; second provider dispatch refused", protected, receiptIdentity, m.poolObservationSnapshot()}, nil
 }

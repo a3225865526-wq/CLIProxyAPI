@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	log "github.com/sirupsen/logrus"
 )
 
 // SetRetryConfig updates additional credential retry rounds, the per-round credential limit, and the cooldown wait interval.
@@ -88,6 +91,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		defer m.poolGuard.mu.Unlock()
 	}
 	NormalizeCredentialMetadata(auth.Metadata)
+	if m.poolGuard != nil {
+		ApplyPersistentManagementIsolation(auth)
+	}
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("register auth: %w", errWeight)
 	}
@@ -108,6 +114,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	now := time.Now()
 	if auth.Generation == 0 {
 		auth.Generation = 1
+		if recoveryGeneration, okRecovery := PersistedRecoveryGeneration(auth); okRecovery {
+			auth.Generation = recoveryGeneration
+		}
 	}
 	if auth.CreatedAt.IsZero() {
 		auth.CreatedAt = now
@@ -128,9 +137,19 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.RegistrationEpoch > m.authEpochs[auth.ID] {
 		m.authEpochs[auth.ID] = auth.RegistrationEpoch
 	}
+	if existing := m.auths[auth.ID]; m.poolGuard != nil && existing != nil && ManagementIsolation(existing) {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata[ManagementDisabledKey] = true
+		quarantinePoolAuth(auth)
+	}
 	m.authEpochs[auth.ID]++
 	auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	auth.Generation = 1
+	if recoveryGeneration, okRecovery := PersistedRecoveryGeneration(auth); okRecovery {
+		auth.Generation = recoveryGeneration
+	}
 	if err := m.invalidatePoolReplacement(ctx, m.auths[auth.ID], auth); err != nil {
 		m.mu.Unlock()
 		return nil, err
@@ -183,6 +202,9 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if m.poolGuard != nil {
 		m.poolGuard.mu.Lock()
 		defer m.poolGuard.mu.Unlock()
@@ -195,7 +217,41 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
+		if _, explicit := ctx.Value(managementStatusKey{}).(managementStatusExpectation); explicit {
+			return nil, fmt.Errorf("management status: identity removed")
+		}
 		return nil, nil
+	}
+	management, explicitManagement := ctx.Value(managementStatusKey{}).(managementStatusExpectation)
+	// A watcher can have synthesized isolation before the recovery WAL commit
+	// and queued that unversioned snapshot behind this transaction. Recheck the
+	// durable enabled account and COMMITTED proof while holding the identity lock;
+	// a current disk disable (or unverifiable proof) must still take effect.
+	if !explicitManagement && m.staleRecoveryIsolationSnapshot(ctx, existing, auth) {
+		current := existing.Clone()
+		m.mu.Unlock()
+		return current, nil
+	}
+	if explicitManagement && (management.id != existing.ID || management.digest != PoolCredentialDigest(existing) || management.generation != existing.Generation || management.epoch != existing.RegistrationEpoch) {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("management status: stale identity or generation")
+	}
+	recovery, isRecovery := ctx.Value(managementRecoveryContextKey{}).(managementRecoveryPlan)
+	recoveryAttempt := existing.Disabled && !auth.Disabled
+	if isRecovery {
+		if !existing.Disabled || !ManagementIsolation(existing) {
+			m.mu.Unlock()
+			return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recovery.opID, Err: fmt.Errorf("account is not durably isolated")}
+		}
+		if management.revision != recovery.expected.revision {
+			m.mu.Unlock()
+			return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recovery.opID, Err: fmt.Errorf("stale pool revision")}
+		}
+		currentPool, errPool := m.poolGrants()
+		if errPool != nil || currentPool.Revision != recovery.expected.revision {
+			m.mu.Unlock()
+			return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recovery.opID, Err: fmt.Errorf("stale pool revision")}
+		}
 	}
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64)
@@ -220,15 +276,37 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			NormalizeCredentialMetadata(auth.Metadata)
 		}
 	}
+	if m.poolGuard != nil && auth.Disabled {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		// Any pool update that installs an operator-disabled runtime state must
+		// carry the durable management fence, including legacy direct callers.
+		auth.Metadata[ManagementDisabledKey] = true
+	}
+	if !explicitManagement && ManagementIsolation(existing) {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata[ManagementDisabledKey] = true
+		quarantinePoolAuth(auth)
+	}
 	if err := m.invalidatePoolReplacement(ctx, existing, auth); err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
 	if m.poolGuard != nil {
-		if (mode == updateModeRefresh || mode == updateModePrepare) && existing.Disabled {
+		if ManagementIsolation(auth) {
 			quarantinePoolAuth(auth)
 		}
-		if _, err := m.poolGrant(auth, firstPoolGrantModel(m, auth), nil); err != nil {
+		if (mode == updateModeRefresh || mode == updateModePrepare || shouldSkipPersist(ctx)) && existing.Disabled {
+			quarantinePoolAuth(auth)
+		}
+		if _, errPoolGrant := m.poolGrant(auth, firstPoolGrantModel(m, auth), nil); errPoolGrant != nil {
+			if isRecovery {
+				m.mu.Unlock()
+				return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recovery.opID, Err: fmt.Errorf("recovery authorization is not currently granted: %w", errPoolGrant)}
+			}
 			quarantinePoolAuth(auth)
 		}
 	}
@@ -252,6 +330,32 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		auth.Generation = existing.Generation + 1
 	} else {
 		auth.Generation++
+	}
+	var recoveryOperation ManagementRecoveryOperation
+	if isRecovery {
+		recoveryOperation = ManagementRecoveryOperation{
+			OpID: recovery.opID, AuthID: auth.ID, CredentialDigest: PoolCredentialDigest(auth),
+			Generation: auth.Generation, Revision: recovery.expected.revision,
+			State: ManagementRecoveryPrepared, TargetDisabled: false,
+		}
+		if recoveryStore, okStore := m.store.(ManagementRecoveryStore); !okStore {
+			m.mu.Unlock()
+			return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recovery.opID, Err: fmt.Errorf("backend does not support FileStore WAL recovery")}
+		} else if errPrepare := recoveryStore.PrepareManagementRecovery(ctx, auth.Clone(), recoveryOperation); errPrepare != nil {
+			m.mu.Unlock()
+			var outcomeErr *ManagementRecoveryOutcomeError
+			if errors.As(errPrepare, &outcomeErr) {
+				return nil, outcomeErr
+			}
+			return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recovery.opID, Err: errPrepare}
+		}
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata[RecoveryOpIDKey] = recoveryOperation.OpID
+		auth.Metadata[RecoveryGenerationKey] = recoveryOperation.Generation
+		auth.Metadata[RecoveryRevisionKey] = recoveryOperation.Revision
+		auth.Metadata[RecoveryStateKey] = string(ManagementRecoveryPrepared)
 	}
 	cooldownStateChanged := false
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
@@ -298,6 +402,77 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		}
 	}
 	authClone := auth.Clone()
+	disabledChanged := existing != nil && existing.Disabled != auth.Disabled
+	isDisabledUpdate := auth.Disabled || disabledChanged
+	// Disabled transitions are security-critical. Persist the candidate before
+	// granting new dispatch eligibility; failed disables publish isolation only.
+	if isDisabledUpdate && !persistMetaMint {
+		persistCtx := ctx
+		if isRecovery {
+			persistCtx = WithManagementRecoveryDurability(ctx)
+		}
+		errPersist := m.persist(persistCtx, authClone)
+		if errPersist == nil && m.poolGuard != nil && explicitManagement && !isRecovery && authClone.Disabled {
+			if durable, supported := m.store.(ManagementDisableStore); supported {
+				errPersist = durable.ConfirmManagementDisable(ctx, authClone)
+			} else {
+				errPersist = fmt.Errorf("management disable: backend cannot confirm durable isolation")
+			}
+		}
+		if errPersist != nil && explicitManagement && !isRecovery && authClone.Disabled && (recoveryAttempt || (existing.Disabled && ManagementIsolation(existing))) {
+			if durable, supported := m.store.(ManagementDisableStore); supported && durable.ConfirmManagementDisable(ctx, authClone) == nil {
+				errPersist = nil
+			}
+		}
+		if errPersist != nil {
+			// Save may have committed before reporting an error. A failed disable
+			// remains isolated in memory; it is never reported as a durable success.
+			// A failed recovery leaves the already-disabled entry untouched.
+			if authClone.Disabled && !isRecovery && !recoveryAttempt {
+				quarantinePoolAuth(authClone)
+				m.auths[auth.ID] = authClone
+				delete(m.poolRegistryVersions, auth.ID)
+				registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(authClone.Clone())
+				}
+				m.structuralEpoch.Add(1)
+			}
+			m.mu.Unlock()
+			if isRecovery {
+				verified, errVerify := m.store.(ManagementRecoveryStore).VerifyManagementRecovery(ctx, authClone, recoveryOperation)
+				if errVerify == nil && verified == ManagementRecoveryPrepared {
+					return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recoveryOperation.OpID, Err: errPersist}
+				}
+				if errVerify != nil {
+					return nil, &ManagementRecoveryOutcomeError{Status: "UNKNOWN", OpID: recoveryOperation.OpID, Err: errVerify}
+				}
+				return nil, &ManagementRecoveryOutcomeError{Status: "UNKNOWN", OpID: recoveryOperation.OpID, Err: errPersist}
+			}
+			return nil, fmt.Errorf("failed to persist Disabled state: %w", errPersist)
+		}
+		if isRecovery {
+			recoveryStore := m.store.(ManagementRecoveryStore)
+			recoveryOperation.State = ManagementRecoveryPrepared
+			state, errCommit := recoveryStore.CommitManagementRecovery(ctx, authClone, recoveryOperation)
+			verified, errVerify := recoveryStore.VerifyManagementRecovery(ctx, authClone, recoveryOperation)
+			if errVerify != nil || verified != ManagementRecoveryCommitted {
+				m.mu.Unlock()
+				if errVerify == nil && verified == ManagementRecoveryPrepared {
+					return nil, &ManagementRecoveryOutcomeError{Status: "NOT_COMMITTED", OpID: recoveryOperation.OpID, Err: errCommit}
+				}
+				return nil, &ManagementRecoveryOutcomeError{Status: "UNKNOWN", OpID: recoveryOperation.OpID, Err: errVerify}
+			}
+			if errCommit != nil || state != ManagementRecoveryCommitted {
+				// The durable COMMITTED record is authoritative even when the
+				// response from the final write was lost.
+			}
+			if authClone.Metadata == nil {
+				authClone.Metadata = make(map[string]any)
+			}
+			authClone.Metadata[RecoveryStateKey] = string(ManagementRecoveryCommitted)
+		}
+	}
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
@@ -308,14 +483,19 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
-	if !persistMetaMint {
-		_ = m.persist(ctx, auth)
+	if !persistMetaMint && !isDisabledUpdate {
+		if errPersist := m.persist(ctx, auth); errPersist != nil {
+			// Non-critical persist failure: log but allow update to succeed for backward compatibility.
+			log.Warnf("persist failed for non-critical update on %s: %v", auth.ID, errPersist)
+		}
+		// Preserve the ordinary update hook/return contract for store enrichment.
+		authClone = auth.Clone()
 	}
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	m.hook.OnAuthUpdated(ctx, authClone.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
 	}
-	return auth.Clone(), nil
+	return authClone.Clone(), nil
 }
 
 // Remove deletes an auth from runtime state without persisting.
@@ -445,6 +625,13 @@ func (m *Manager) Load(ctx context.Context) error {
 			continue
 		}
 		NormalizeCredentialMetadata(auth.Metadata)
+		if m.poolGuard != nil {
+			ApplyPersistentManagementIsolation(auth)
+			if old := previousAuths[auth.ID]; old != nil && ManagementIsolation(old) {
+				auth.Metadata[ManagementDisabledKey] = true
+				quarantinePoolAuth(auth)
+			}
+		}
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
@@ -457,6 +644,9 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.authEpochs[auth.ID] = max(m.authEpochs[auth.ID], auth.RegistrationEpoch) + 1
 		auth.RegistrationEpoch = m.authEpochs[auth.ID]
 		auth.Generation = 1
+		if recoveryGeneration, okRecovery := PersistedRecoveryGeneration(auth); okRecovery {
+			auth.Generation = recoveryGeneration
+		}
 		m.auths[auth.ID] = auth.Clone()
 	}
 

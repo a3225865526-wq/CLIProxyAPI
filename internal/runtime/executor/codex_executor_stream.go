@@ -32,6 +32,19 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
+	if cliproxyexecutor.ResponsesSSE(ctx) {
+		locallyUnavailable := strings.TrimSpace(apiKey) == ""
+		if auth != nil && auth.Metadata != nil {
+			if expired, ok := auth.Metadata["expired"].(string); ok {
+				if at, errExpiry := time.Parse(time.RFC3339, expired); errExpiry == nil && !at.After(time.Now()) {
+					locallyUnavailable = true
+				}
+			}
+		}
+		if locallyUnavailable {
+			return nil, cliproxyexecutor.LocalAccountUnavailable(ctx)
+		}
+	}
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -145,6 +158,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	scanner := bufio.NewScanner(httpResp.Body)
+	if cliproxyexecutor.ResponsesSSE(ctx) {
+		scanner.Split(helps.SplitResponsesSSE)
+	}
 	scanner.Buffer(nil, 52_428_800) // 50MB
 	claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 	var param any
@@ -193,6 +209,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				isHandshake = true
 			} else if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if errReceipt := cliproxyexecutor.PersistResponsesSSEEvent(ctx, data); errReceipt != nil {
+					closeBootstrapBody()
+					return nil, errReceipt
+				}
 				helps.ObserveCodexUpstreamWork(ctx, data)
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
 				data = helps.AnnotateCodexMetering(data, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))
@@ -366,6 +386,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				translatedLine = transformed
 			} else if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if errReceipt := cliproxyexecutor.PersistResponsesSSEEvent(ctx, data); errReceipt != nil {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: errReceipt}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				helps.ObserveCodexUpstreamWork(ctx, data)
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
 				data = helps.AnnotateCodexMetering(data, reporter, helps.CodexMeteringRequested(ctx, opts.Headers))

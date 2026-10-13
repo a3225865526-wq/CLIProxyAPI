@@ -67,6 +67,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
+	if h.authManager.PoolRole() != "" && (coreauth.IsPluginVirtualAuth(targetAuth) || coreauth.IsConfigAPIKeyAuth(targetAuth)) {
+		c.JSON(http.StatusConflict, gin.H{"error": "pool management status: persistence path is not qualified"})
+		return
+	}
 	if coreauth.IsPluginVirtualAuth(targetAuth) {
 		// Allow status changes only when targeting the source auth file name, matching delete semantics.
 		// Expanded virtual project auths still cannot be modified independently.
@@ -126,8 +130,23 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	applyAuthDisabledState(targetAuth, *req.Disabled)
-	updatedAuth, err := h.authManager.Update(ctx, targetAuth)
+	updatedAuth, err := h.authManager.UpdateManagementStatus(ctx, targetAuth, *req.Disabled)
 	if err != nil {
+		if h.authManager.PoolRole() != "" {
+			outcome := "UNKNOWN"
+			var recoveryErr *coreauth.ManagementRecoveryOutcomeError
+			if errors.As(err, &recoveryErr) {
+				outcome = recoveryErr.Status
+			} else if !*req.Disabled {
+				outcome = "NOT_COMMITTED"
+			}
+			response := gin.H{"error": fmt.Sprintf("failed to update auth: %v", err), "commit_status": outcome}
+			if recoveryErr != nil && recoveryErr.OpID != "" {
+				response["operation_id"] = recoveryErr.OpID
+			}
+			c.JSON(http.StatusInternalServerError, response)
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
@@ -139,6 +158,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	h.authStatusMu.Unlock()
 	if errHook := h.invokePostAuthPersistHooks(ctx, []*coreauth.Auth{hookAuth}); errHook != nil {
 		log.Errorf("post-auth persist hook failed for status update on %s: %v", targetAuth.ID, errHook)
+		if h.authManager.PoolRole() != "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to synchronize auth runtime: %v", errHook), "commit_status": "COMMITTED"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to synchronize auth runtime: %v", errHook)})
 		return
 	}

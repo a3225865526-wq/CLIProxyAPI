@@ -5,6 +5,7 @@ import "context"
 type skipPersistContextKey struct{}
 type deferAPIKeyModelAliasRebuildContextKey struct{}
 type authCreationIntentContextKey struct{}
+type managementRecoveryDurabilityContextKey struct{}
 
 // WithAuthCreationIntent returns a derived context that allows a token store to
 // create a missing disabled credential. It is intended only for the immediate
@@ -25,6 +26,24 @@ func HasAuthCreationIntent(ctx context.Context) bool {
 	v := ctx.Value(authCreationIntentContextKey{})
 	enabled, ok := v.(bool)
 	return ok && enabled
+}
+
+// WithManagementRecoveryDurability marks the account write that is part of
+// the recovery commit protocol. Stores must reject the operation unless they
+// can provide their qualified file and directory durability barrier.
+func WithManagementRecoveryDurability(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, managementRecoveryDurabilityContextKey{}, true)
+}
+
+func RequiresManagementRecoveryDurability(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(managementRecoveryDurabilityContextKey{}).(bool)
+	return enabled
 }
 
 // WithSkipPersist returns a derived context that disables persistence for Manager Update/Register calls.

@@ -192,7 +192,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 // isSchedulableAuth determines whether an auth can be scheduled by a provider scheduler,
 // returning its normalized ID and providerKey.
 func isSchedulableAuth(auth *Auth) (string, string, bool) {
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+	if auth == nil || auth.Disabled || ManagementIsolation(auth) || auth.Status == StatusDisabled {
 		return "", "", false
 	}
 	authID := strings.TrimSpace(auth.ID)

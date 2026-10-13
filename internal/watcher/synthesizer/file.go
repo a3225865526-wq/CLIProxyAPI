@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	kimiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -85,6 +86,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	if errWeight := coreauth.ValidateAuthWeight(&coreauth.Auth{Metadata: metadata}); errWeight != nil {
 		return nil, fmt.Errorf("invalid weight in %s: %w", filepath.Base(fullPath), errWeight)
 	}
+	persistentDisabled := coreauth.PersistentAuthDisabled(metadata)
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
 	if provider == "gemini" {
@@ -104,12 +106,21 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 			}
 			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
-			disabled, _ := metadata["disabled"].(bool)
+			// SECURITY: Fail-closed default for plugin auth parsing.
+			disabled := true
+			if disabledValue, ok := metadata["disabled"].(bool); ok {
+				disabled = disabledValue
+			}
 			for index, auth := range auths {
 				if auth == nil {
 					continue
 				}
 				coreauth.NormalizeCredentialMetadata(auth.Metadata)
+				if auth.Metadata == nil {
+					auth.Metadata = make(map[string]any)
+				}
+				auth.Metadata[coreauth.ManagementDisabledKey] = metadata[coreauth.ManagementDisabledKey]
+				coreauth.ApplyPersistentManagementIsolation(auth)
 				if len(auths) > 1 {
 					coreauth.MarkPluginVirtualAuth(auth, fullPath, index)
 				}
@@ -148,6 +159,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
 				coreauth.ApplyCustomHeadersFromMetadata(auth)
 				applyFingerprintProfileAttribute(auth, metadata)
+				sdkAuth.EnforceManagementRecoveryAdmission(auth, fullPath)
 			}
 			return auths, nil
 		}
@@ -184,7 +196,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		}
 	}
 
-	disabled, _ := metadata["disabled"].(bool)
+	disabled := persistentDisabled
 	status := coreauth.StatusActive
 	if disabled {
 		status = coreauth.StatusDisabled
@@ -259,6 +271,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 			}
 		}
 	}
+	sdkAuth.EnforceManagementRecoveryAdmission(a, fullPath)
 	return []*coreauth.Auth{a}, nil
 }
 

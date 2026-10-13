@@ -115,6 +115,9 @@ func (e *poolProbeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (
 
 func poolGuardFixture(t *testing.T, role string, nativeTools ...bool) (*Manager, *poolProbeExecutor, *Auth, string, PoolGrantFile) {
 	t.Helper()
+	if os.Getenv("CLEARAPI_PG02_RESPONSES_SSE") != "true" {
+		t.Setenv("CLEARAPI_PG02_HTTP_NON_STREAM", "true")
+	}
 	root := t.TempDir()
 	dir := filepath.Join(root, "auths")
 	if err := os.Mkdir(dir, 0700); err != nil {
@@ -306,6 +309,21 @@ func TestPoolGuardRejectsManifestFailuresAndCredentialChange(t *testing.T) {
 
 func TestPoolGuardRefreshPauseAndRestartPreserveQuarantine(t *testing.T) {
 	m, executor, auth, file, record := poolGuardFixture(t, "service")
+	revision, trustBefore, err := m.PoolTrustSnapshot()
+	if err != nil || len(trustBefore) != 1 {
+		t.Fatal("trust baseline unavailable", err)
+	}
+	// Token rotation while active retains authorization without promotion.
+	rotated := auth.Clone()
+	rotated.Metadata["access_token"] = "synthetic-rotated"
+	rotated, err = m.Update(context.Background(), rotated)
+	if err != nil || rotated.Disabled {
+		t.Fatal("active token rotation churned trust", err)
+	}
+	if err := poolRequest(m); err != nil || executor.calls.Load() != 1 {
+		t.Fatal("active token rotation broke trusted admission", err)
+	}
+	auth = rotated
 	auth.Disabled = true
 	paused, err := m.Update(context.Background(), auth)
 	if err != nil {
@@ -319,21 +337,24 @@ func TestPoolGuardRefreshPauseAndRestartPreserveQuarantine(t *testing.T) {
 		t.Fatal("refresh unpaused auth")
 	}
 	_, err = m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native"}, cliproxyexecutor.Options{})
-	if err == nil || executor.calls.Load() != 0 {
+	if err == nil || executor.calls.Load() != 1 {
 		t.Fatal("paused auth executed")
 	}
-	// A normal access-token rotation must not churn trust: the canonical
-	// identity is stable (PG-29 v2), so the existing promotion keeps admitting.
-	rotated := updated.Clone()
+	// Stable trust never authorizes clearing a separate management isolation.
+	rotated = updated.Clone()
 	rotated.Disabled = false
 	rotated.Status = StatusActive
 	rotated.Metadata["access_token"] = "synthetic-rotated"
 	rotated, err = m.Update(context.Background(), rotated)
-	if err != nil || rotated.Disabled {
-		t.Fatal("normal token rotation churned trust")
+	if err != nil || !rotated.Disabled || !ManagementIsolation(rotated) {
+		t.Fatal("token rotation cleared management isolation", err)
 	}
-	if err := poolRequest(m); err != nil || executor.calls.Load() != 1 {
-		t.Fatal("token rotation broke trusted admission", err)
+	revisionAfter, trustAfter, err := m.PoolTrustSnapshot()
+	if err != nil || revisionAfter != revision || len(trustAfter) != 1 || trustAfter[0] != trustBefore[0] {
+		t.Fatal("stable token rotation changed trust revision or generation", err)
+	}
+	if poolRequest(m) == nil || executor.calls.Load() != 1 {
+		t.Fatal("isolated token rotation dispatched")
 	}
 	// Replacing the stable account identity is a credential replacement. It can
 	// never self-admit — not with the same auth ID, file name, or metadata claim.

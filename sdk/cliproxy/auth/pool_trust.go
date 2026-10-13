@@ -250,6 +250,11 @@ func (m *Manager) commitPoolTrust(ctx context.Context, expected uint64, identiti
 				return ErrPoolGuard
 			}
 			candidate := auth.Clone()
+			// Validate trust independently of management isolation; this probe
+			// is never installed or persisted as a recovery operation.
+			if candidate.Metadata != nil {
+				candidate.Metadata[ManagementDisabledKey] = false
+			}
 			candidate.Disabled = false
 			candidate.Status = StatusActive
 			if _, err := m.matchPoolGrant(record, candidate, firstGrantModel(record, identity.AuthID), nil); err != nil {
@@ -280,6 +285,9 @@ func (m *Manager) commitPoolTrust(ctx context.Context, expected uint64, identiti
 	// Do not publish it in manager memory until both security writes succeed.
 	if state == PoolTrustTrusted {
 		for _, identity := range identities {
+			if ManagementIsolation(m.auths[identity.AuthID]) {
+				continue
+			}
 			candidate := m.auths[identity.AuthID].Clone()
 			candidate.Disabled = false
 			candidate.Status = StatusActive
@@ -316,6 +324,9 @@ func (m *Manager) commitPoolTrust(ctx context.Context, expected uint64, identiti
 	}
 	if state == PoolTrustTrusted {
 		for _, identity := range identities {
+			if ManagementIsolation(m.auths[identity.AuthID]) {
+				continue
+			}
 			installed := m.auths[identity.AuthID].Clone()
 			installed.Disabled = false
 			installed.Status = StatusActive

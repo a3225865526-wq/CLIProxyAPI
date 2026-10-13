@@ -68,13 +68,18 @@ func (m *Manager) PublishPoolModels(snapshot *Auth, provider string, models []*r
 	defer m.poolGuard.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.publishPoolModelsLocked(snapshot, provider, models)
+}
+
+// Caller holds poolGuard.mu then manager.mu.
+func (m *Manager) publishPoolModelsLocked(snapshot *Auth, provider string, models []*registry.ModelInfo) bool {
 	a := m.auths[snapshot.ID]
 	if a == nil || a.Generation != snapshot.Generation || a.Disabled != snapshot.Disabled || PoolCredentialDigest(a) != PoolCredentialDigest(snapshot) {
 		return false
 	}
 	record, err := m.loadPoolGrants(true)
 	allowed := make([]*registry.ModelInfo, 0, len(models))
-	if err == nil && !a.Disabled && provider == a.Provider {
+	if err == nil && !a.Disabled && !ManagementIsolation(a) && provider == a.Provider {
 		for _, info := range models {
 			if info != nil && m.poolModelCheck(record, a, m.selectionModelForAuth(a, info.ID), nil) == nil {
 				allowed = append(allowed, info)

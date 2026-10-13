@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -127,4 +128,52 @@ func TestClaudeExecutorSharedCredentialMetadataMixedAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// Setup-token checks must share the lock used by profile and device-pool writes,
+// including when the map is initialized by a concurrent request.
+func TestClaudeExecutorSetupTokenMetadataConcurrentAccess(t *testing.T) {
+	for _, initialized := range []bool{false, true} {
+		t.Run(fmt.Sprint(initialized), func(t *testing.T) {
+			auth := newSharedClaudeOAuthAuth("claude-setup-race")
+			if !initialized {
+				auth.Metadata = nil
+			}
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for i := 0; i < 16; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					for j := 0; j < 256; j++ {
+						if i%2 == 0 {
+							claudeauth.StoreMetadataValue(&auth.Metadata, "skip_account_profile", false)
+							claudeauth.StoreMetadataValue(&auth.Metadata, "is_setup_token", false)
+							claudeauth.StoreMetadataValue(&auth.Metadata, "setup_token", false)
+							claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", "synthetic-profile")
+						} else {
+							_ = isClaudeSetupToken(auth, "sk-ant-oat-race-probe")
+						}
+					}
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+		})
+	}
+}
+
+func TestClaudeExecutorSetupTokenMetadataFlags(t *testing.T) {
+	for _, key := range []string{"skip_account_profile", "is_setup_token", "setup_token"} {
+		t.Run(key, func(t *testing.T) {
+			auth := newSharedClaudeOAuthAuth("claude-setup-flags")
+			for _, value := range []any{false, "true", true} {
+				claudeauth.StoreMetadataValue(&auth.Metadata, key, value)
+				if got, want := isClaudeSetupToken(auth, "sk-ant-oat-race-probe"), value == true; got != want {
+					t.Fatalf("flag %s=%v: got %v, want %v", key, value, got, want)
+				}
+			}
+		})
+	}
 }

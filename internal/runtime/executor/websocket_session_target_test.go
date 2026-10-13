@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -276,6 +277,80 @@ func TestWebsocketPayloadWriteFailureClearsActiveSessionState(t *testing.T) {
 			sess.activeMu.Unlock()
 			if active {
 				t.Fatal("payload write failure left the old active websocket state")
+			}
+		})
+	}
+}
+
+type rejectCodexPayloadGuard struct {
+	connects atomic.Int32
+	payloads atomic.Int32
+}
+
+func (g *rejectCodexPayloadGuard) AuthorizeConnect() error {
+	g.connects.Add(1)
+	return nil
+}
+
+func (g *rejectCodexPayloadGuard) AuthorizeDispatch() error {
+	g.payloads.Add(1)
+	return cliproxyauth.ErrAccountRevoked
+}
+
+func TestCodexStreamPayloadFenceClearsActiveState(t *testing.T) {
+	for _, sessionID := range []string{"", "payload-fence"} {
+		t.Run(fmt.Sprintf("persistent=%v", sessionID != ""), func(t *testing.T) {
+			var messages atomic.Int32
+			closed := make(chan struct{})
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+				if errUpgrade != nil {
+					t.Errorf("upgrade websocket: %v", errUpgrade)
+					return
+				}
+				defer close(closed)
+				defer func() { _ = conn.Close() }()
+				if _, _, errRead := conn.ReadMessage(); errRead == nil {
+					messages.Add(1)
+				}
+			}))
+			defer server.Close()
+			exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+			auth := &cliproxyauth.Auth{ID: "synthetic-fence", Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse,
+				Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}}
+			guard := &rejectCodexPayloadGuard{}
+			ctx := cliproxyexecutor.WithUpstreamAttemptTracker(cliproxyexecutor.WithDispatchGuard(context.Background(), guard))
+			result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":"synthetic"}`)}, opts)
+			if !errors.Is(err, cliproxyauth.ErrAccountRevoked) || result != nil {
+				t.Fatalf("dispatch rejection = %v/%v, want no stream and revocation", result, err)
+			}
+			if guard.connects.Load() != 1 || guard.payloads.Load() != 1 {
+				t.Fatalf("connect/payload fences = %d/%d, want 1/1 with no retry", guard.connects.Load(), guard.payloads.Load())
+			}
+			if sessionID != "" {
+				sess := exec.getOrCreateSession(sessionID)
+				sess.activeMu.Lock()
+				active := sess.activeConn != nil || sess.activeCh != nil || sess.activeDone != nil || sess.activeCancel != nil
+				sess.activeMu.Unlock()
+				if active {
+					t.Fatal("dispatch rejection retained active session state")
+				}
+				if !sess.reqMu.TryLock() {
+					t.Fatal("dispatch rejection retained request lock")
+				}
+				sess.reqMu.Unlock()
+				exec.CloseExecutionSession(sessionID)
+			}
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("owned connection was not closed")
+			}
+			if messages.Load() != 0 {
+				t.Fatal("rejected payload reached upstream")
 			}
 		})
 	}

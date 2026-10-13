@@ -747,10 +747,14 @@ type usageTTFTRoundTripper struct {
 }
 
 func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := cliproxyexecutor.BeforeUpstreamDispatch(req.Context()); err != nil {
+	if err := cliproxyexecutor.BeforeUpstreamDispatch(req.Context(), req); err != nil {
 		return nil, err
 	}
 	cliproxyexecutor.MarkUpstreamAttempt(req.Context())
+	if err := cliproxyexecutor.MarkUpstreamDispatchStarted(req.Context()); err != nil {
+		return nil, err
+	}
+	pg02TransportStarted(req.Context())
 	t.reporter.StartResponseTTFT()
 	resp, errRoundTrip := t.base.RoundTrip(req)
 	if errRoundTrip != nil {

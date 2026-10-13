@@ -134,6 +134,9 @@ func (m *Manager) poolModelAdmitted(record *PoolGrantFile, auth *Auth, model str
 // for one candidate model. Callers may pass a record they already loaded to
 // avoid rereading the policy file per candidate.
 func (m *Manager) poolModelCheck(record *PoolGrantFile, auth *Auth, model string, capabilities []string) error {
+	if ManagementIsolation(auth) {
+		return ErrPoolGuard
+	}
 	if _, err := m.matchPoolGrant(record, auth, model, capabilities); err != nil {
 		return err
 	}

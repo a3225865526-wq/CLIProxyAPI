@@ -48,6 +48,10 @@ func (e poolAccountingError) ResponseBody() []byte {
 	return data
 }
 func poolAccountingTermination(err error, lease *poolLease) error {
+	var capacity *poolCapacityRejection
+	if errors.As(err, &capacity) {
+		return err
+	}
 	if !errors.Is(err, ErrAccountRevoked) && !errors.Is(err, ErrPoolGuard) {
 		return err
 	}
@@ -81,23 +85,41 @@ type PoolInFlight struct {
 
 type poolLease struct {
 	PoolInFlight
-	manager           *Manager
-	auth              *Auth
-	req               cliproxyexecutor.Request
-	caps              []string
-	requestedModel    string
-	ctx               context.Context
-	cancel            context.CancelCauseFunc
-	once              sync.Once
-	resourceMu        sync.Mutex
-	closeFn           func() error
-	resourceClosed    bool
-	stopClose         func() bool
-	consumeAttempt    bool
-	connectAuthorized bool
-	payloadAuthorized bool
-	meterMu           sync.Mutex
-	meter             *usage.CodexMetering
+	manager            *Manager
+	auth               *Auth
+	req                cliproxyexecutor.Request
+	caps               []string
+	requestedModel     string
+	attemptID          string
+	sessionID          string
+	ctx                context.Context
+	cancel             context.CancelCauseFunc
+	stateMu            sync.Mutex
+	retained           bool
+	executionEnded     bool
+	executionFinalized bool
+	transportEnded     bool
+	transportEndReason string
+	finalEnded         bool
+	resourceMu         sync.Mutex
+	closeFn            func() error
+	resourceClosed     bool
+	stopClose          func() bool
+	consumeAttempt     bool
+	persistent         bool
+	connectAuthorized  bool
+	payloadAuthorized  bool
+	meterMu            sync.Mutex
+	meter              *usage.CodexMetering
+	receiptID          string
+	receiptState       string
+	receiptRequestID   string
+	receiptFailed      bool
+	protocolAdmitted   func() bool
+	receiptSSE         bool
+	receiptFinal       bool
+	previousReceiptID  string
+	sseFinalEvent      receiptEvent
 }
 
 func (lease *poolLease) observeMetering(m *usage.CodexMetering) {
@@ -158,21 +180,89 @@ func (lease *poolLease) Bind(closeFn func() error) error {
 	return nil
 }
 
-func (lease *poolLease) End(string) {
-	lease.once.Do(func() {
-		guard := lease.manager.poolGuard
-		guard.mu.Lock()
-		delete(guard.leases, lease.RequestID)
-		guard.countsMu.Lock()
-		guard.counts[lease.AuthID]--
-		guard.countsMu.Unlock()
-		guard.mu.Unlock()
-		lease.cancel(nil)
-		if lease.stopClose != nil {
-			lease.stopClose()
+func (lease *poolLease) Retain() {
+	lease.stateMu.Lock()
+	defer lease.stateMu.Unlock()
+	if lease.persistent && !lease.finalEnded && lease.ctx.Err() == nil {
+		lease.retained = true
+	}
+}
+
+// TransportClosed records a terminal reader handoff without canceling buffered
+// output. The consumer still owns the turn until End; an already drained turn
+// can release its retained lifecycle immediately.
+func (lease *poolLease) TransportClosed(reason string) {
+	lease.stateMu.Lock()
+	lease.transportEnded = true
+	lease.transportEndReason = reason
+	finalized := lease.executionFinalized
+	poolObserveLease(lease, "transport_closed", reason)
+	lease.stateMu.Unlock()
+	if finalized {
+		lease.End(reason)
+	}
+}
+
+func (lease *poolLease) finalizeExecution() {
+	guard := lease.manager.poolGuard
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if guard.receipts != nil && !lease.receiptFinal {
+		if lease.receiptSSE {
+			if err := lease.writeSSEFinalLocked(nil, "execution_ended_without_terminal"); err != nil {
+				lease.receiptFailed = true
+				lease.receiptState = "UNKNOWN"
+			}
+		} else {
+			if err := guard.receipts.final(lease, lease.receiptState); err != nil {
+				lease.receiptState = "UNKNOWN"
+				lease.receiptFailed = true
+				logEntryWithRequestID(lease.ctx).Warn("transport receipt persistence failed; evidence UNKNOWN")
+			}
 		}
-		lease.closeResource()
-	})
+	}
+	guard.countsMu.Lock()
+	guard.counts[lease.AuthID]--
+	guard.countsMu.Unlock()
+}
+
+// End releases the turn's concurrency slot exactly once. A retained socket
+// stays in the revocation table until session close or ownership transfer.
+func (lease *poolLease) End(reason string) {
+	lease.stateMu.Lock()
+	defer lease.stateMu.Unlock()
+	if lease.finalEnded {
+		return
+	}
+	poolObserveLease(lease, "lease_end_begin", reason)
+	if !lease.executionFinalized {
+		lease.executionFinalized = true
+		lease.finalizeExecution()
+	}
+	if lease.retained && !lease.transportEnded && reason == "stream_end" && lease.ctx.Err() == nil {
+		lease.executionEnded = true
+		poolObserveLease(lease, "turn_drained_retained", reason)
+		return
+	}
+	lease.finalEnded = true
+	if lease.retained && reason == "target_replaced" {
+		// Codex installed the new lifecycle before ending the previous owner.
+		// Disarm the old closer before canceling its context.
+		lease.resourceMu.Lock()
+		lease.closeFn = nil
+		lease.resourceClosed = true
+		lease.resourceMu.Unlock()
+	}
+	guard := lease.manager.poolGuard
+	guard.mu.Lock()
+	delete(guard.leases, lease.RequestID)
+	guard.mu.Unlock()
+	lease.cancel(nil)
+	if lease.stopClose != nil {
+		lease.stopClose()
+	}
+	lease.closeResource()
+	poolObserveLease(lease, "lease_end_complete", reason)
 }
 
 func (lease *poolLease) AuthorizeDispatch() error {
@@ -183,10 +273,45 @@ func (lease *poolLease) AuthorizeConnect() error {
 	return lease.authorizeOperation(true)
 }
 
-func (lease *poolLease) authorizeOperation(connect bool) error {
+func (lease *poolLease) UpstreamDispatchStarted() error {
+	guard := lease.manager.poolGuard
+	if guard.receipts == nil {
+		return nil
+	}
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if guard.leases[lease.RequestID] != lease || !lease.Dispatched {
+		return ErrPoolGuard
+	}
+	if lease.receiptState == "STARTED" {
+		return nil
+	}
+	if lease.receiptFailed {
+		return ErrPoolGuard
+	}
+	if err := guard.receipts.started(lease); err != nil {
+		lease.receiptState = "UNKNOWN"
+		lease.receiptFailed = true
+		lease.cancel(ErrPoolGuard)
+		return ErrPoolGuard
+	}
+	lease.receiptState = "STARTED"
+	return nil
+}
+
+func (lease *poolLease) authorizeOperation(connect bool) (err error) {
 	guard := lease.manager.poolGuard
 	guard.mu.Lock()
 	defer guard.mu.Unlock()
+	defer func() { poolObserveFence(lease, connect, err == nil) }()
+	if lease.protocolAdmitted == nil || !lease.protocolAdmitted() {
+		return poolAccountingError{cause: ErrPoolGuard, dispatched: lease.Dispatched}
+	}
+	// The existing receipt contract certifies HTTP non-stream invocations only.
+	// Never mislabel a credential-bearing websocket handshake as zero transport.
+	if connect && guard.receipts != nil {
+		return ErrPoolGuard
+	}
 	if cause := context.Cause(lease.ctx); cause != nil {
 		return cause
 	}
@@ -195,7 +320,7 @@ func (lease *poolLease) authorizeOperation(connect bool) error {
 	}
 	lease.manager.mu.RLock()
 	current := lease.manager.auths[lease.AuthID]
-	matches := current != nil && !current.Disabled && current.Status != StatusDisabled && PoolCredentialDigest(current) == lease.CredentialDigest
+	matches := current != nil && !current.Disabled && !ManagementIsolation(current) && current.Status != StatusDisabled && PoolCredentialDigest(current) == lease.CredentialDigest
 	lease.manager.mu.RUnlock()
 	if !matches {
 		return ErrPoolGuard
@@ -225,6 +350,9 @@ func (lease *poolLease) authorizeOperation(connect bool) error {
 		}
 	}
 	lease.Dispatched = true
+	if guard.receipts != nil {
+		lease.receiptState = "UNKNOWN"
+	}
 	if connect {
 		lease.connectAuthorized = true
 	} else {

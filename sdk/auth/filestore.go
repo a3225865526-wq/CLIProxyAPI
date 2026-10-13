@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -132,23 +133,23 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if jsonEqual(existing, raw) {
 				break
 			}
-			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-			if errOpen != nil {
-				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+			writeJSON := writeAuthJSONAtomic
+			if cliproxyauth.RequiresManagementRecoveryDurability(ctx) {
+				writeJSON = writeAuthJSONDurable
 			}
-			if _, errWrite := file.Write(raw); errWrite != nil {
-				_ = file.Close()
-				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
-			}
-			if errClose := file.Close(); errClose != nil {
-				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+			if errWrite := writeJSON(path, raw); errWrite != nil {
+				return "", errWrite
 			}
 			break
 		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
+		writeJSON := writeAuthJSONAtomic
+		if cliproxyauth.RequiresManagementRecoveryDurability(ctx) {
+			writeJSON = writeAuthJSONDurable
+		}
+		if errWrite := writeJSON(path, raw); errWrite != nil {
+			return "", errWrite
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
@@ -166,6 +167,53 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
+}
+
+// writeAuthJSONAtomic writes a complete JSON document to a sibling temporary
+// file before replacing the auth file. A failed or interrupted write therefore
+// cannot leave a truncated document that changes the account's load state.
+func writeAuthJSONAtomic(path string, data []byte) error {
+	tmp, errCreate := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if errCreate != nil {
+		return fmt.Errorf("auth filestore: create temporary file failed: %w", errCreate)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if errChmod := tmp.Chmod(0o600); errChmod != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("auth filestore: chmod temporary file failed: %w", errChmod)
+	}
+	count, errWrite := tmp.Write(data)
+	if errWrite == nil && count != len(data) {
+		errWrite = io.ErrShortWrite
+	}
+	if errWrite == nil {
+		errWrite = tmp.Sync()
+	}
+	if errClose := tmp.Close(); errWrite == nil {
+		errWrite = errClose
+	}
+	if errWrite != nil {
+		return fmt.Errorf("auth filestore: write temporary file failed: %w", errWrite)
+	}
+	if errRename := os.Rename(tmpName, path); errRename != nil {
+		// Never delete the committed destination to make replacement succeed.
+		return fmt.Errorf("auth filestore: replace file failed: %w", errRename)
+	}
+	return nil
+}
+
+func writeAuthJSONDurable(path string, data []byte) error {
+	if !managementPersistenceQualified() {
+		return fmt.Errorf("auth filestore: durable recovery persistence is not qualified on this platform")
+	}
+	if errWrite := writeAuthJSONAtomic(path, data); errWrite != nil {
+		return errWrite
+	}
+	if errSyncDir := syncManagementDirectory(filepath.Dir(path)); errSyncDir != nil {
+		return fmt.Errorf("auth filestore: sync directory failed: %w", errSyncDir)
+	}
+	return nil
 }
 
 // List enumerates all auth JSON files under the configured directory.
@@ -240,6 +288,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
 	cliproxyauth.NormalizeCredentialMetadata(metadata)
+	persistentDisabled := cliproxyauth.PersistentAuthDisabled(metadata)
 	if errWeight := cliproxyauth.ValidateAuthWeight(&cliproxyauth.Auth{Metadata: metadata}); errWeight != nil {
 		return nil, errWeight
 	}
@@ -264,12 +313,21 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 			if len(auths) == 0 {
 				return nil, nil
 			}
-			disabled, _ := metadata["disabled"].(bool)
+			// SECURITY: Fail-closed default for plugin auth parsing.
+			disabled := true
+			if disabledValue, ok := metadata["disabled"].(bool); ok {
+				disabled = disabledValue
+			}
 			for index, auth := range auths {
 				if auth == nil {
 					continue
 				}
 				cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
+				if auth.Metadata == nil {
+					auth.Metadata = make(map[string]any)
+				}
+				auth.Metadata[cliproxyauth.ManagementDisabledKey] = metadata[cliproxyauth.ManagementDisabledKey]
+				cliproxyauth.ApplyPersistentManagementIsolation(auth)
 				if len(auths) > 1 {
 					cliproxyauth.MarkPluginVirtualAuth(auth, path, index)
 				}
@@ -305,6 +363,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 					}
 				}
 				cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+				enforceRecoveryAdmission(auth, path)
 			}
 			return auths, nil
 		}
@@ -317,7 +376,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		return nil, fmt.Errorf("stat file: %w", errStat)
 	}
 	id := s.idFor(path, baseDir)
-	disabled, _ := metadata["disabled"].(bool)
+	disabled := persistentDisabled
 	status := cliproxyauth.StatusActive
 	if disabled {
 		status = cliproxyauth.StatusDisabled
@@ -358,6 +417,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 		auth.Attributes["email"] = email
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	enforceRecoveryAdmission(auth, path)
 	return []*cliproxyauth.Auth{auth}, nil
 }
 

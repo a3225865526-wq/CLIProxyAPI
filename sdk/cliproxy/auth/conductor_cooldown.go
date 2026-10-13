@@ -757,12 +757,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	modelKey := canonicalModelKey(result.Model)
 
+	// Pool result mutations and policy-checked publication form one admission boundary.
+	if m.poolGuard != nil {
+		m.poolGuard.mu.Lock()
+	}
 	var authSnapshot *Auth
 	cooldownStateChanged := false
 	now := time.Now()
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		m.poolObserveResultLocked(ctx, result, "mark_result_before")
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
 			if m != nil {
 				modelKey = m.selectionModelKeyForAuth(auth, result.RouteModel)
@@ -993,12 +998,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
+		if m.poolGuard != nil {
+			models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+			m.publishPoolModelsLocked(authSnapshot, authSnapshot.Provider, models)
+		}
+		m.poolObserveResultLocked(ctx, result, "mark_result_after")
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 			cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 		}
 	}
 	m.mu.Unlock()
+	if m.poolGuard != nil {
+		m.poolGuard.mu.Unlock()
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
 		if !result.CredentialScope && modelKey != "" {

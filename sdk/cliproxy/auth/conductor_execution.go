@@ -272,6 +272,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errStream == nil {
 			return result, nil
 		}
+		if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) {
+			return nil, unwrapExecutionBoundaryError(errStream)
+		}
 		if hasUpstreamExecutionAttempt(errStream) {
 			preferredUpstreamErr = errStream
 		}
@@ -915,6 +918,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 }
 
 func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int) (*cliproxyexecutor.StreamResult, error) {
+	var sseFallback *poolSSEZeroDispatchError
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1177,8 +1181,19 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
+		if sseFallback != nil {
+			execCtx = context.WithValue(execCtx, poolSSEFallbackContextKey{}, sseFallback)
+		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
+			if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) {
+				if isPoolSSEZeroDispatchError(errStream) && len(attempted) == 1 && !cliproxyexecutor.UpstreamAttempted(execCtx) {
+					errors.As(errStream, &sseFallback)
+					lastErr = errStream
+					continue
+				}
+				return nil, wrapRequestStopError(errStream)
+			}
 			if isRequestTerminatedError(errStream) || isRequestStopError(errStream) {
 				return nil, errStream
 			}

@@ -848,6 +848,9 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	// delivered, so a disconnect it already observed must not end the lease early.
 	// A revoke keeps its own path: it never delivers a terminal read first.
 	if terminalHandedOff {
+		if observer, ok := lifecycle.(interface{ TransportClosed(string) }); ok {
+			observer.TransportClosed(reason)
+		}
 		return
 	}
 	if lifecycle != nil {
