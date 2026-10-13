@@ -245,6 +245,10 @@ func (w *receiptWriter) event(lease *poolLease, event, state string, sequence in
 // The parent is the exact record minted by this writer after a durable local
 // rejection. Re-read it before B starts; memory provenance alone is insufficient.
 func (w *receiptWriter) verifyZeroDispatchParent(final receiptEvent) (resultErr error) {
+	return w.verifyZeroDispatchRecord(final, false)
+}
+
+func (w *receiptWriter) verifyZeroDispatchRecord(final receiptEvent, chainValidated bool) (resultErr error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	defer func() {
@@ -252,7 +256,7 @@ func (w *receiptWriter) verifyZeroDispatchParent(final receiptEvent) (resultErr 
 			w.faulted.Store(true)
 		}
 	}()
-	if w.faulted.Load() || final.Schema != 2 || final.Path != "HTTP_RESPONSES_SSE" || final.State != "NOT_STARTED" || final.Sequence != 2 || final.Event != "FINAL" || final.PreviousReceiptID != "" || final.SSE == nil || final.SSE.DispatchState != "NOT_STARTED" || final.SSE.ResultState != "FAILED" || final.SSE.EndReason != "account_credential_locally_unavailable" || final.ProcessEpoch != w.processEpoch || final.ExecutorBinarySHA != w.binarySHA || final.ProcessID != w.processID || final.ProcessStartTicks != w.startTicks || !validReceiptID(final.ReceiptID) {
+	if w.faulted.Load() || final.Schema != 2 || final.Path != "HTTP_RESPONSES_SSE" || final.State != "NOT_STARTED" || final.Sequence != 2 || final.Event != "FINAL" || (!chainValidated && final.PreviousReceiptID != "") || final.SSE == nil || final.SSE.DispatchState != "NOT_STARTED" || final.SSE.ResultState != "FAILED" || final.SSE.EndReason != "account_credential_locally_unavailable" || final.ProcessEpoch != w.processEpoch || final.ExecutorBinarySHA != w.binarySHA || final.ProcessID != w.processID || final.ProcessStartTicks != w.startTicks || !validReceiptID(final.ReceiptID) {
 		return ErrPoolGuard
 	}
 	directory, err := openReceiptDirectory(w.dir)

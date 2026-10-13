@@ -497,7 +497,16 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 				cancel(ErrPoolGuard)
 				return nil, ErrPoolGuard
 			}
-			if err := guard.receipts.verifyZeroDispatchParent(proof.final); err != nil {
+			verifyParent := func() error { return guard.receipts.verifyZeroDispatchParent(proof.final) }
+			if chain, ok := ctx.Value(poolSSEFallbackChainContextKey{}).(*poolSSEFallbackChain); ok && auth.Provider == "codex" {
+				verifyParent = func() error {
+					if chain.count() == 0 || chain.count() >= maxPG03SSEFallbackAccounts || chain.proofs[chain.count()-1] != proof {
+						return ErrPoolGuard
+					}
+					return guard.receipts.verifyZeroDispatchChain(chain.proofs[:chain.count()-1], proof.final)
+				}
+			}
+			if err := verifyParent(); err != nil {
 				cancel(ErrPoolGuard)
 				return nil, ErrPoolGuard
 			}

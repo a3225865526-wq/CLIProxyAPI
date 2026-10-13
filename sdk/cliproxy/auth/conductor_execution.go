@@ -919,6 +919,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int) (*cliproxyexecutor.StreamResult, error) {
 	var sseFallback *poolSSEZeroDispatchError
+	var sseChain *poolSSEFallbackChain
+	if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) && len(providers) == 1 && providers[0] == "codex" {
+		sseChain = &poolSSEFallbackChain{}
+		maxRetryCredentials = maxPG03SSEFallbackAccounts
+	}
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -943,6 +948,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	var upstreamErr error
 	var roundTiming homeRetryRoundTiming
 	for {
+		if sseChain != nil && sseChain.count() >= maxPG03SSEFallbackAccounts {
+			return nil, wrapRequestStopError(lastErr)
+		}
 		allowSameAuthRetry := homeMode && homeSameAuthRetryPending && lastHomeAuthID != "" && homeSameAuthRetries[lastHomeAuthID] == 0
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry {
 			if lastErr != nil {
@@ -996,6 +1004,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				selection.End("missing_execution_target")
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		if sseChain != nil {
+			_, repeated := tried[auth.ID]
+			if repeated || provider != "codex" {
+				if selection != nil {
+					selection.End("repeated_sse_fallback_auth")
+				}
+				return nil, wrapRequestStopError(ErrPoolGuard)
+			}
 		}
 		if homeMode {
 			m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
@@ -1075,6 +1092,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			aliasResult.OriginalAlias = responseAlias
 		}
 		if len(models) == 0 {
+			if sseChain != nil {
+				releaseAttempt()
+				if selection != nil {
+					selection.End("no_execution_models")
+				}
+				return nil, wrapRequestStopError(ErrPoolGuard)
+			}
 			if selection != nil {
 				homeExcludedAuthIDs[auth.ID] = struct{}{}
 				lastHomeAuthID = auth.ID
@@ -1094,6 +1118,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		}
 		if errPrepare != nil {
+			if sseChain != nil {
+				releaseAttempt()
+				if selection != nil {
+					selection.End("prepare_failed")
+				}
+				return nil, wrapRequestStopError(errPrepare)
+			}
 			if selection != nil {
 				excludeAuth := shouldExcludeHomeAuthAfterStreamError(execCtx, auth, errPrepare)
 				if homeSameAuthRetries[auth.ID] > 0 {
@@ -1183,10 +1214,36 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		if sseFallback != nil {
 			execCtx = context.WithValue(execCtx, poolSSEFallbackContextKey{}, sseFallback)
+			if sseChain != nil {
+				snapshot := &poolSSEFallbackChain{proofs: append([]*poolSSEZeroDispatchError(nil), sseChain.proofs...)}
+				execCtx = context.WithValue(execCtx, poolSSEFallbackChainContextKey{}, snapshot)
+			}
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
 			if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) {
+				if sseChain != nil {
+					if errProof := sseChain.reject(execCtx, errStream, m.poolGuard.receipts); errProof != nil {
+						releaseAttempt()
+						if selection != nil {
+							selection.End("sse_fallback_blocked")
+						}
+						if isPoolSSEZeroDispatchError(errStream) {
+							return nil, wrapRequestStopError(errProof)
+						}
+						return nil, wrapRequestStopError(errStream)
+					}
+					sseFallback = sseChain.proofs[sseChain.count()-1]
+					lastErr = errStream
+					if selection != nil {
+						homeExcludedAuthIDs[auth.ID] = struct{}{}
+						releaseAttempt()
+						if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "sse_zero_dispatch"); errEnd != nil {
+							return nil, errEnd
+						}
+					}
+					continue
+				}
 				if isPoolSSEZeroDispatchError(errStream) && len(attempted) == 1 && !cliproxyexecutor.UpstreamAttempted(execCtx) {
 					errors.As(errStream, &sseFallback)
 					lastErr = errStream
