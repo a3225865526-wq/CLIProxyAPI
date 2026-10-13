@@ -918,11 +918,15 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 }
 
 func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int) (*cliproxyexecutor.StreamResult, error) {
+	policy, policyAuthIDs, errPolicy := m.pg03Policy(ctx, providers, opts)
+	if errPolicy != nil {
+		return nil, wrapRequestStopError(errPolicy)
+	}
 	var sseFallback *poolSSEZeroDispatchError
 	var sseChain *poolSSEFallbackChain
-	if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) && len(providers) == 1 && providers[0] == "codex" {
+	if policy != nil {
 		sseChain = &poolSSEFallbackChain{}
-		maxRetryCredentials = maxPG03SSEFallbackAccounts
+		maxRetryCredentials = min(len(policyAuthIDs), policy.MaxFallbackCount+1)
 	}
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -963,6 +967,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		pickOpts := opts
+		if policy != nil {
+			pickOpts.Metadata = cloneRequestMetadata(opts.Metadata)
+			pickOpts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = policyAuthIDs[len(attempted)]
+		}
 		if homeMode {
 			pickOpts = withHomeRetryRound(pickOpts, retryRound)
 			pickOpts = withHomeAuthCount(pickOpts, homeAuthCount)
@@ -1007,7 +1015,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		if sseChain != nil {
 			_, repeated := tried[auth.ID]
-			if repeated || provider != "codex" {
+			if repeated || provider != "codex" || auth.ID != policyAuthIDs[len(attempted)] {
 				if selection != nil {
 					selection.End("repeated_sse_fallback_auth")
 				}
