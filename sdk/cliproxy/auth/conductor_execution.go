@@ -261,6 +261,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	var lastErr error
 	var preferredUpstreamErr error
 	homeRetryLimit := -1
+	refundPolicy, refundAuthIDs, _ := m.pg03Policy(ctx, normalized, opts)
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	attempt := 0
 	retryRoundPending := false
@@ -273,7 +274,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return result, nil
 		}
 		if isPoolAttemptContext(ctx) && poolResponsesSSEAdmitted(ctx, opts) {
-			return nil, unwrapExecutionBoundaryError(errStream)
+			return nil, m.pg03ZeroDispatchRefund(ctx, refundPolicy, refundAuthIDs, unwrapExecutionBoundaryError(errStream))
 		}
 		if hasUpstreamExecutionAttempt(errStream) {
 			preferredUpstreamErr = errStream

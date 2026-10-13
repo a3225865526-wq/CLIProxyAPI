@@ -549,3 +549,131 @@ func TestPG03SSEFallbackChainProofValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestPG03ZeroDispatchRefund(t *testing.T) {
+	for _, name := range []string{"complete", "single", "limited", "absent", "started", "unknown", "missing-ancestor", "tampered-ancestor", "canonical-tamper", "wrong-root", "broken-parent", "dispatched", "cancelled"} {
+		t.Run(name, func(t *testing.T) {
+			probe := &pg03StreamProbe{rejects: 5}
+			m := pg03ChainFixture(t, probe)
+			ctx, opts := capacityOptions("refund-" + name)
+			opts.OriginalRequest = []byte(`{"model":"synthetic-native","stream":true}`)
+			installPG03TestPolicy(t, &opts)
+			if name == "single" || name == "limited" {
+				payload, err := base64.RawURLEncoding.DecodeString(opts.Headers.Get(pg03PolicyHeader))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var policy pg03PolicySnapshot
+				if err := json.Unmarshal(payload, &policy); err != nil {
+					t.Fatal(err)
+				}
+				policy.MaxFallbackCount = 1
+				if name == "single" {
+					policy.AccountOrder, policy.MaxFallbackCount = policy.AccountOrder[:1], 0
+				}
+				payload, err = json.Marshal(policy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mac := hmac.New(sha256.New, []byte(os.Getenv("CLEARAPI_PG03_POLICY_KEY")))
+				mac.Write([]byte("clearapi-pg03-policy-v1\n"))
+				mac.Write(payload)
+				opts.Headers.Set(pg03PolicyHeader, base64.RawURLEncoding.EncodeToString(payload))
+				opts.Headers.Set(pg03SignatureHeader, hex.EncodeToString(mac.Sum(nil)))
+			}
+			if name == "absent" {
+				for _, header := range []string{pg03PolicyHeader, pg03SignatureHeader, pg03RequestHeader} {
+					opts.Headers.Del(header)
+				}
+			}
+			if name == "started" || name == "unknown" {
+				probe.rejects, probe.mode = 0, name
+			}
+			policy, ids, _ := m.pg03Policy(ctx, []string{"codex"}, opts)
+			_, err := m.executeStreamMixedOnce(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "synthetic-native", Payload: opts.OriginalRequest}, opts, 5, nil, 0, 0)
+			if err == nil {
+				t.Fatal("expected terminal failure")
+			}
+			err = unwrapExecutionBoundaryError(err)
+			var terminal *poolSSEZeroDispatchError
+			errors.As(err, &terminal)
+			first := filepath.Join(probe.dir, poolReceiptIDForTest("refund-"+name, "refund-"+name+"-attempt", "pg03-A")+".jsonl")
+			switch name {
+			case "missing-ancestor":
+				if err := os.Rename(first, first+".missing"); err != nil {
+					t.Fatal(err)
+				}
+			case "tampered-ancestor":
+				if err := os.WriteFile(first, []byte("tampered\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "canonical-tamper":
+				data, err := os.ReadFile(first)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				var begin, final receiptEvent
+				if json.Unmarshal([]byte(lines[0]), &begin) != nil || json.Unmarshal([]byte(lines[1]), &final) != nil {
+					t.Fatal("invalid test receipt")
+				}
+				begin.AccountGeneration++
+				final.AccountGeneration++
+				beginData, err := json.Marshal(begin)
+				if err != nil {
+					t.Fatal(err)
+				}
+				finalData, err := json.Marshal(final)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(first, append(append(append(beginData, '\n'), finalData...), '\n'), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "wrong-root":
+				if terminal == nil {
+					t.Fatal("missing terminal proof")
+				}
+				terminal.final.RequestID = "other-request"
+			case "broken-parent":
+				if terminal == nil {
+					t.Fatal("missing terminal proof")
+				}
+				terminal.final.PreviousReceiptID = ""
+			case "dispatched":
+				ctx.Value(poolAttemptContextKey{}).(*atomicPoolAttempt).Store(true)
+			case "cancelled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			result := m.pg03ZeroDispatchRefund(ctx, policy, ids, err)
+			var accounting poolAccountingError
+			refund := errors.As(result, &accounting) && !accounting.dispatched && name != "started" && name != "unknown"
+			if refund != (name == "complete") {
+				t.Fatalf("refund=%v name=%s error=%v", refund, name, result)
+			}
+			if name == "complete" {
+				if len(probe.order) != 4 || len(probe.dispatches) != 0 {
+					t.Fatalf("order=%v dispatch=%v", probe.order, probe.dispatches)
+				}
+				var body struct {
+					Error struct {
+						Code     string
+						Metadata struct {
+							Dispatched bool `json:"codex_upstream_dispatched"`
+						}
+					}
+				}
+				if err := json.Unmarshal(accounting.ResponseBody(), &body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Error.Code != "pool_admission_required" || body.Error.Metadata.Dispatched {
+					t.Fatal("did not reuse existing zero-dispatch accounting response")
+				}
+			} else if result != err {
+				t.Fatal("unsafe or incomplete chain changed its terminal error")
+			}
+		})
+	}
+}
