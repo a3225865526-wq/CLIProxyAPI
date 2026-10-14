@@ -1,0 +1,168 @@
+name: Release Executor image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full 40-character Executor source commit
+        required: true
+        type: string
+      version:
+        description: Release version (for example pg03-rc1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-executor-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      image_digest: ${{ steps.publish.outputs.image_digest }}
+      image_ref: ${{ steps.publish.outputs.image_ref }}
+      binary_sha256: ${{ steps.published.outputs.binary_sha256 }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_REPOSITORY: ghcr.io/a3225865526-wq/clearapi-executor
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY_OWNER" == 'a3225865526-wq' ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+          [[ "$RELEASE_VERSION" != dev && "$RELEASE_VERSION" != latest && "$RELEASE_VERSION" != none ]]
+
+      # Use verification logic from the workflow ref, not the selected source ref.
+      - name: Check out release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Check out exact source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: source
+          persist-credentials: false
+
+      - name: Validate source and capture release metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ -f source/Dockerfile && -f source/.dockerignore ]]
+          cmp tooling/Dockerfile source/Dockerfile
+          cmp tooling/.dockerignore source/.dockerignore
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "SOURCE_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+          echo "LOCAL_TAG=$IMAGE_REPOSITORY:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+
+      - name: Build once without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: ./source
+          file: ./source/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.LOCAL_TAG }}
+          build-args: |
+            VERSION=${{ env.RELEASE_VERSION }}
+            COMMIT=${{ env.SOURCE_COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+            SOURCE=${{ env.SOURCE_URL }}
+
+      - name: Verify local image
+        id: local
+        shell: bash
+        run: bash tooling/.github/scripts/verify-executor-image.sh "$LOCAL_TAG"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish verified image and resolve digest
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$LOCAL_TAG"
+          IMAGE_DIGEST=$(docker image inspect "$LOCAL_TAG" | python3 -c 'import json,os,re,sys; refs=json.load(sys.stdin)[0]["RepoDigests"]; prefix=os.environ["IMAGE_REPOSITORY"]+"@"; ds={r[len(prefix):] for r in refs if r.startswith(prefix)}; assert len(ds)==1; d=ds.pop(); assert re.fullmatch(r"sha256:[0-9a-f]{64}",d); print(d)')
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+          echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image_ref=$IMAGE_REPOSITORY@$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          docker pull --platform linux/amd64 "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+
+      - name: Verify published image by digest
+        id: published
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tooling/.github/scripts/verify-executor-image.sh "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+          [[ "$(cat executor-binary.sha256)" == '${{ steps.local.outputs.binary_sha256 }}' ]]
+          [[ "$(docker image inspect --format '{{.Id}}' "$IMAGE_REPOSITORY@$IMAGE_DIGEST")" == '${{ steps.local.outputs.image_id }}' ]]
+
+      - name: Write verified release artifact
+        shell: bash
+        env:
+          BINARY_SHA256: ${{ steps.published.outputs.binary_sha256 }}
+          IMAGE_ID: ${{ steps.published.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          e = os.environ
+          manifest = {
+              "schema_version": 1, "component": "pool-executor",
+              "image_repository": e["IMAGE_REPOSITORY"],
+              "image_digest": e["IMAGE_DIGEST"],
+              "image_ref": e["IMAGE_REPOSITORY"] + "@" + e["IMAGE_DIGEST"],
+              "platform": "linux/amd64", "platform_manifest_digest": e["IMAGE_DIGEST"],
+              "image_id": e["IMAGE_ID"], "oci_revision": e["SOURCE_COMMIT"],
+              "source_repository": e["SOURCE_URL"], "source_commit": e["SOURCE_COMMIT"],
+              "version": e["RELEASE_VERSION"], "build_date": e["BUILD_DATE"],
+              "binary_path": "/CLIProxyAPI/CLIProxyAPI", "binary_sha256": e["BINARY_SHA256"],
+              "workflow_repository": e["GITHUB_REPOSITORY"],
+              "workflow_path": ".github/workflows/release-executor.yml",
+              "workflow_commit": e["GITHUB_SHA"], "workflow_ref": e["GITHUB_WORKFLOW_REF"],
+              "workflow_run_id": e["GITHUB_RUN_ID"], "workflow_run_attempt": e["GITHUB_RUN_ATTEMPT"],
+              "workflow_run_url": e["SOURCE_URL"] + "/actions/runs/" + e["GITHUB_RUN_ID"],
+              "verification": {"platform": "passed", "metadata": "passed", "binary": "passed", "health": "passed"},
+              "sbom": None, "provenance": None
+          }
+          with open("executor-image-release.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          with open(e["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## Verified Executor image\n\n```json\n" + json.dumps(manifest, indent=2) + "\n```\n")
+          PY
+
+      - name: Upload release manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: executor-image-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: executor-image-release.json
+          if-no-files-found: error

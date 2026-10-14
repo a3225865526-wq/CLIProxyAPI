@@ -1,0 +1,46 @@
+# Only compilation inputs enter the builder. Runtime configuration is mounted.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!sdk/
+!sdk/**
+!Dockerfile
+!.dockerignore
+
+# Defense in depth for state accidentally placed under source directories.
+**/.git
+**/.env
+**/.env.*
+**/auths
+**/auths/**
+**/secrets
+**/secrets/**
+**/runtime-state
+**/runtime-state/**
+**/receipts
+**/receipts/**
+**/config*.yaml
+**/config*.yml
+**/*.yaml
+**/*.yml
+**/*.json
+# These JSON files are required by go:embed and contain model definitions.
+!internal/registry/models/models.json
+!internal/registry/models/devin_models.json
+!internal/registry/models/codex_client_models.json
+**/*.pem
+**/*.key
+**/id_ed25519*
+**/id_rsa*
+**/*.log
+**/*.journal
+**/*.jsonl
+**/*.db
+**/*.sqlite*
+**/checkpoint.json
+**/admission.json
+**/*_test.go
