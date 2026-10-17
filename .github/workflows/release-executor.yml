@@ -59,6 +59,13 @@ jobs:
           path: source
           persist-credentials: false
 
+      - name: Run targeted PG03 import tests
+        working-directory: source
+        shell: bash
+        env:
+          GOWORK: 'off'
+          CGO_ENABLED: '1'
+        run: go test -count=1 ./internal/api/handlers/management -run 'TestImportCredentialAtomic|TestUploadAuthFile_BatchMultipart'
       - name: Validate source and capture release metadata
         id: metadata
         shell: bash
@@ -68,6 +75,7 @@ jobs:
           [[ -f source/Dockerfile && -f source/.dockerignore ]]
           cmp tooling/Dockerfile source/Dockerfile
           cmp tooling/.dockerignore source/.dockerignore
+          [[ -z "$(git -C source status --porcelain)" ]]
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
           echo "SOURCE_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
           echo "LOCAL_TAG=$IMAGE_REPOSITORY:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
