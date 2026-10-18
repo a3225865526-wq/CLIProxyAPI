@@ -68,8 +68,11 @@ type receiptEvent struct {
 	Sequence          int              `json:"sequence"`
 	State             string           `json:"state"`
 	SSE               *sseReceiptFinal `json:"sse,omitempty"`
-	AccountEvidenceID string           `json:"account_evidence_id,omitempty"`
-	PreviousReceiptID string           `json:"previous_receipt_id,omitempty"`
+	// Images carries the schema-3 image business result. It contains counts and
+	// references only; image bytes are persisted separately by imagesResultStore.
+	Images            *imagesReceiptFinal `json:"images,omitempty"`
+	AccountEvidenceID string              `json:"account_evidence_id,omitempty"`
+	PreviousReceiptID string              `json:"previous_receipt_id,omitempty"`
 }
 
 // SSE evidence is versioned separately; schema-1 bytes and hashes are unchanged.
@@ -196,7 +199,7 @@ func (w *receiptWriter) write(event receiptEvent) (resultErr error) {
 		}
 		for index, line := range lines {
 			previous := event
-			previous.SSE = nil
+			previous.SSE, previous.Images = nil, nil
 			previous.Sequence = index + 1
 			previous.Event, previous.State = "BEGIN", "UNKNOWN"
 			if index == 1 {
@@ -236,6 +239,13 @@ func (w *receiptWriter) event(lease *poolLease, event, state string, sequence in
 		result.PreviousReceiptID = lease.previousReceiptID
 		// The Gateway attempt identifies the channel send. An unstarted account
 		// rejection is not a second channel attempt; it has its own durable ID.
+		digest := sha256.Sum256([]byte(requestID + "\n" + attemptID + "\n" + result.AccountRef + "\n" + strconv.FormatUint(lease.Generation, 10)))
+		result.AccountEvidenceID = hex.EncodeToString(digest[:])
+	}
+	if lease.receiptImages {
+		result.Path, result.Schema = "HTTP_IMAGES_JSON", 3
+		// Image receipts key the evidence on the Gateway-declared attempt so a
+		// duplicate FINAL for the same attempt can be recognised as a replay.
 		digest := sha256.Sum256([]byte(requestID + "\n" + attemptID + "\n" + result.AccountRef + "\n" + strconv.FormatUint(lease.Generation, 10)))
 		result.AccountEvidenceID = hex.EncodeToString(digest[:])
 	}
@@ -296,6 +306,66 @@ func (w *receiptWriter) verifyZeroDispatchRecord(final receiptEvent, chainValida
 		return ErrPoolGuard
 	}
 	return nil
+}
+
+// readAttempt returns every durable event for one request/attempt pair. The
+// receipt file name is derived from the same deterministic identity the lease
+// uses, so a restart or a query never depends on in-memory state.
+func (w *receiptWriter) readAttempt(requestID, attemptID string) ([]map[string]any, error) {
+	if w == nil {
+		return nil, ErrPoolGuard
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.faulted.Load() {
+		return nil, ErrPoolGuard
+	}
+	directory, err := openReceiptDirectory(w.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = directory.Close() }()
+	entries, err := directory.Readdirnames(4096)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range entries {
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		file, err := openReceiptFile(directory, name, false)
+		if err != nil {
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, 1<<20))
+		_ = file.Close()
+		if readErr != nil {
+			continue
+		}
+		matched := make([]map[string]any, 0, 3)
+		matchedAll := true
+		for _, line := range bytes.Split(bytes.TrimSpace(data), []byte{'\n'}) {
+			if len(line) == 0 {
+				continue
+			}
+			var event map[string]any
+			if json.Unmarshal(line, &event) != nil {
+				matchedAll = false
+				break
+			}
+			eventRequestID, _ := event["request_id"].(string)
+			eventAttemptID, _ := event["attempt_id"].(string)
+			if eventRequestID != requestID || eventAttemptID != attemptID {
+				matchedAll = false
+				break
+			}
+			matched = append(matched, event)
+		}
+		if matchedAll && len(matched) > 0 {
+			return matched, nil
+		}
+	}
+	return nil, ErrPoolGuard
 }
 
 func (w *receiptWriter) begin(lease *poolLease) error {

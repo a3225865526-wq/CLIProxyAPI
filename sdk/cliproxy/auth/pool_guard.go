@@ -102,6 +102,8 @@ type poolGuard struct {
 	now          func() time.Time
 	receipts     *receiptWriter
 	receiptErr   error
+	images       *imagesResultStore
+	imagesErr    error
 }
 
 func newPoolGuard() *poolGuard {
@@ -110,7 +112,8 @@ func newPoolGuard() *poolGuard {
 		return nil
 	}
 	receipts, receiptErr := newReceiptWriter()
-	return &poolGuard{role: role, file: os.Getenv("CLEARAPI_POOL_ADMISSION_FILE"), executorID: strings.TrimSpace(os.Getenv("CLEARAPI_POOL_EXECUTOR_ID")), checkpoint: os.Getenv("CLEARAPI_POOL_CHECKPOINT_FILE"), counts: make(map[string]int), receipts: receipts, receiptErr: receiptErr}
+	images, imagesErr := newImagesResultStore()
+	return &poolGuard{role: role, file: os.Getenv("CLEARAPI_POOL_ADMISSION_FILE"), executorID: strings.TrimSpace(os.Getenv("CLEARAPI_POOL_EXECUTOR_ID")), checkpoint: os.Getenv("CLEARAPI_POOL_CHECKPOINT_FILE"), counts: make(map[string]int), receipts: receipts, receiptErr: receiptErr, images: images, imagesErr: imagesErr}
 }
 
 func (m *Manager) PoolRole() string {
@@ -378,6 +381,14 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	if stream && guard.receipts == nil {
 		return nil, ErrPoolGuard
 	}
+	imagesPolicy, _ := ctx.Value(poolImagesPolicyContextKey{}).(*pg03ImagesPolicySnapshot)
+	if imagesPolicy != nil {
+		// A controlled image operation always needs its result store: a success
+		// receipt may only be published after the payload is durable.
+		if stream || guard.receipts == nil || guard.images == nil || guard.imagesErr != nil {
+			return nil, ErrPoolGuard
+		}
+	}
 	if guard.receipts != nil && (guard.receipts.faulted.Load() || !consumeAttempt) {
 		return nil, ErrPoolGuard
 	}
@@ -411,6 +422,15 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	if err != nil {
 		return nil, err
 	}
+	if imagesPolicy != nil {
+		// Operation-level admission: image_generation plus both the image model
+		// and the base model must be granted and capability-verified.
+		for _, capability := range poolImagesCapabilities() {
+			if !slices.Contains(caps, capability) {
+				caps = append(caps, capability)
+			}
+		}
+	}
 	record, err := executor.manager.poolGrants()
 	if err != nil {
 		return nil, err
@@ -420,6 +440,12 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 		poolLogModelDecision(ctx, auth, requestedModelFromOptions(opts), req.Model, false, reason, record.Revision, 0)
 		return nil, err
 	}
+	if imagesPolicy != nil {
+		if err := executor.manager.poolImagesAdmitted(record, auth, imagesPolicy, req.Model); err != nil {
+			return nil, err
+		}
+	}
+	_ = grant
 	reason, admitErr := executor.manager.poolModelAdmitted(record, auth, req.Model)
 	if admitErr != nil {
 		poolLogModelDecision(ctx, auth, requestedModelFromOptions(opts), req.Model, false, reason, record.Revision, 0)
@@ -466,6 +492,12 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	if guard.receipts != nil && opts.Headers != nil {
 		attemptID = strings.TrimSpace(opts.Headers.Get("X-ClearAPI-PG02-Attempt"))
 		receiptRequestID = strings.TrimSpace(opts.Headers.Get("X-ClearAPI-PG02-Request"))
+		if _, ok := ctx.Value(poolImagesPolicyContextKey{}).(*pg03ImagesPolicySnapshot); ok {
+			// Images carries its own request/attempt identity; the Responses
+			// correlation headers are neither required nor trusted here.
+			attemptID = strings.TrimSpace(opts.Headers.Get(pg03ImagesAttemptHeader))
+			receiptRequestID = strings.TrimSpace(opts.Headers.Get(pg03ImagesRequestHeader))
+		}
 	}
 	if receiptRequestID == "" {
 		receiptRequestID = internallogging.GetRequestID(ctx)
@@ -490,6 +522,15 @@ func (executor *poolExecutor) begin(ctx context.Context, auth *Auth, req cliprox
 	admission.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: opts.Metadata[cliproxyexecutor.RequestPathMetadataKey]}
 	lease.protocolAdmitted = func() bool { return poolProtocolAdmitted(ctx, admission, stream) }
 	lease.receiptSSE = stream
+	if policy, ok := ctx.Value(poolImagesPolicyContextKey{}).(*pg03ImagesPolicySnapshot); ok && policy != nil {
+		// Images has its own receipt path: schema 3, HTTP_IMAGES_JSON, and a
+		// deterministic receipt ID so a duplicate attempt cannot mint a second one.
+		lease.receiptSSE = false
+		lease.receiptImages = true
+		lease.imagesPolicy = policy
+		digest := sha256.Sum256([]byte(receiptRequestID + "\n" + attemptID + "\n" + auth.ID))
+		lease.receiptID = hex.EncodeToString(digest[:])
+	}
 	if stream {
 		if proof, ok := ctx.Value(poolSSEFallbackContextKey{}).(*poolSSEZeroDispatchError); ok {
 			accountRef := sha256.Sum256([]byte(auth.ID))
@@ -549,6 +590,17 @@ func (executor *poolExecutor) Execute(ctx context.Context, auth *Auth, req clipr
 	response, err := executor.ProviderExecutor.Execute(lease.ctx, auth, req, opts)
 	if cause := context.Cause(lease.ctx); cause != nil {
 		return cliproxyexecutor.Response{}, poolAccountingTermination(cause, lease)
+	}
+	if lease.receiptImages {
+		// A controlled image attempt publishes success only after its payload is
+		// durable. Every other outcome is finalized as UNKNOWN/FAILED here.
+		if err != nil {
+			lease.finalizeImagesExecution("provider_error")
+			return cliproxyexecutor.Response{}, poolAccountingTermination(err, lease)
+		}
+		if persistErr := lease.PersistImagesResult(response.Payload, 1); persistErr != nil {
+			return cliproxyexecutor.Response{}, poolAccountingTermination(persistErr, lease)
+		}
 	}
 	return response, err
 }

@@ -99,6 +99,9 @@ func (lease *poolLease) ValidateDispatchProtocol(req *http.Request) error {
 		return reject()
 	}
 	if !lease.receiptSSE {
+		if lease.receiptImages {
+			return lease.ValidateImagesDispatchProtocol(req)
+		}
 		return nil
 	}
 	if !strings.HasSuffix(req.URL.Path, "/responses") || req.GetBody == nil {
@@ -193,7 +196,23 @@ func (lease *poolLease) writeSSEFinalLocked(payload []byte, reason string) error
 
 // Reuse the SSE gate for every pool invocation, including non-stream execution.
 // The legacy HTTP contract requires a separate explicit process authorization.
+// Images is a distinct operation: it never shares the Responses admission or
+// the legacy non-stream flag.
 func poolProtocolAdmitted(ctx context.Context, opts cliproxyexecutor.Options, stream bool) bool {
+	if policy, ok := ctx.Value(poolImagesPolicyContextKey{}).(*pg03ImagesPolicySnapshot); ok && policy != nil {
+		return !stream && imagesRequestAdmitted(ctx, opts) &&
+			opts.Headers.Get("X-ClearAPI-PG03-Images-Request") == policy.RequestID &&
+			opts.Headers.Get("X-ClearAPI-PG03-Images-Attempt") == policy.AttemptID
+	}
+	if imagesModeEnabled() {
+		if path, _ := opts.Metadata[cliproxyexecutor.RequestPathMetadataKey].(string); path == pg03ImagesPath {
+			// An image generation on the pool path is only ever admitted through
+			// the signed images contract. Without it there is no account
+			// authority, capability binding or durable receipt, so the legacy
+			// non-stream pool flag must not carry it.
+			return false
+		}
+	}
 	sse, legacy := os.Getenv("CLEARAPI_PG02_RESPONSES_SSE"), os.Getenv("CLEARAPI_PG02_HTTP_NON_STREAM")
 	if (sse != "true" && sse != "" && sse != "false") || (legacy != "true" && legacy != "" && legacy != "false") || (sse == "true" && legacy == "true") {
 		return false

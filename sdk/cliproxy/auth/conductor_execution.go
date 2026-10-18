@@ -125,6 +125,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
+	if m.isControlledImagesRequest(ctx, providers, opts) {
+		return m.executeControlledImages(ctx, "codex", req, opts)
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}

@@ -24,6 +24,17 @@ func PersistResponsesSSEEvent(ctx context.Context, payload []byte) error {
 	return nil
 }
 
+// PersistImagesResult is the images analogue of PersistResponsesSSEEvent: the
+// lease makes the payload durable before any success terminal is reported.
+func PersistImagesResult(ctx context.Context, payload []byte, requested int) error {
+	if guard, ok := ctx.Value(dispatchGuardKey{}).(interface {
+		PersistImagesResult([]byte, int) error
+	}); ok {
+		return guard.PersistImagesResult(payload, requested)
+	}
+	return nil
+}
+
 type dispatchGuardKey struct{}
 
 // DispatchGuard authorizes the initiation of an upstream transport operation.

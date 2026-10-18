@@ -117,6 +117,9 @@ type poolLease struct {
 	receiptFailed      bool
 	protocolAdmitted   func() bool
 	receiptSSE         bool
+	receiptImages      bool
+	imagesPolicy       *pg03ImagesPolicySnapshot
+	imagesFinalEvent   receiptEvent
 	receiptFinal       bool
 	previousReceiptID  string
 	sseFinalEvent      receiptEvent
@@ -212,6 +215,12 @@ func (lease *poolLease) finalizeExecution() {
 			if err := lease.writeSSEFinalLocked(nil, "execution_ended_without_terminal"); err != nil {
 				lease.receiptFailed = true
 				lease.receiptState = "UNKNOWN"
+			}
+		} else if lease.receiptImages {
+			if err := lease.writeImagesFinalLocked(nil, imagesReceiptFinal{DispatchState: lease.receiptState, ResultState: "UNKNOWN", RequestedCount: 1, EndReason: "execution_ended_without_result", UsageState: "unavailable"}); err != nil {
+				lease.receiptState = "UNKNOWN"
+				lease.receiptFailed = true
+				logEntryWithRequestID(lease.ctx).Warn("image receipt persistence failed; evidence UNKNOWN")
 			}
 		} else {
 			if err := guard.receipts.final(lease, lease.receiptState); err != nil {
