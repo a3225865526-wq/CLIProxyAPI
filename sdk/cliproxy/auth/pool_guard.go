@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -39,6 +40,13 @@ func (poolAdmissionError) ResponseBody() []byte {
 }
 
 var ErrPoolGuard = poolAdmissionError{}
+
+// ErrPoolReceiptNotFound is the distinct "this attempt has no durable receipt"
+// answer. It is not an admission failure: the Gateway needs it to prove that
+// nothing was dispatched, which is the only evidence that may authorize a
+// handover to another source. It must stay separate from ErrPoolGuard, which
+// covers unusable stores and refused admissions.
+var ErrPoolReceiptNotFound = errors.New("pool receipt not found")
 
 type poolAttemptContextKey struct{}
 type atomicPoolAttempt = atomic.Bool

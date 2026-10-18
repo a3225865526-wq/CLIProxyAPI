@@ -441,6 +441,11 @@ type ImagesExecutionRecord struct {
 // QueryImagesExecution reads the durable receipt for one request/attempt. It
 // answers "did this attempt exist, and what was its trusted outcome" without
 // mutating any state, so a Gateway restart can resolve UNKNOWN safely.
+//
+// An attempt with no receipt returns a populated record with Found=false and
+// no error: that is the trusted zero-dispatch proof the Gateway needs before it
+// may hand over to another source. A broken receipt store still returns an
+// error, so a storage fault can never masquerade as "nothing was sent".
 func (m *Manager) QueryImagesExecution(requestID, attemptID string) (ImagesExecutionRecord, error) {
 	record := ImagesExecutionRecord{Schema: 3, RequestID: requestID, AttemptID: attemptID}
 	if m == nil || m.poolGuard == nil || m.poolGuard.receipts == nil {
@@ -451,6 +456,9 @@ func (m *Manager) QueryImagesExecution(requestID, attemptID string) (ImagesExecu
 	}
 	events, err := m.poolGuard.receipts.readAttempt(requestID, attemptID)
 	if err != nil {
+		if errors.Is(err, ErrPoolReceiptNotFound) {
+			return record, nil
+		}
 		return record, err
 	}
 	record.Events = events

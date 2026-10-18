@@ -308,9 +308,12 @@ func (w *receiptWriter) verifyZeroDispatchRecord(final receiptEvent, chainValida
 	return nil
 }
 
-// readAttempt returns every durable event for one request/attempt pair. The
-// receipt file name is derived from the same deterministic identity the lease
-// uses, so a restart or a query never depends on in-memory state.
+// readAttempt returns every durable event for one request/attempt pair, or
+// ErrPoolReceiptNotFound when this attempt never wrote a receipt. The caller
+// must be able to distinguish "no durable attempt exists" (a trusted
+// zero-dispatch fact) from "the receipt store itself is unusable": conflating
+// them would make the Gateway treat a broken store as proof that nothing was
+// sent.
 func (w *receiptWriter) readAttempt(requestID, attemptID string) ([]map[string]any, error) {
 	if w == nil {
 		return nil, ErrPoolGuard
@@ -326,7 +329,7 @@ func (w *receiptWriter) readAttempt(requestID, attemptID string) ([]map[string]a
 	}
 	defer func() { _ = directory.Close() }()
 	entries, err := directory.Readdirnames(4096)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	for _, name := range entries {
@@ -365,7 +368,7 @@ func (w *receiptWriter) readAttempt(requestID, attemptID string) ([]map[string]a
 			return matched, nil
 		}
 	}
-	return nil, ErrPoolGuard
+	return nil, ErrPoolReceiptNotFound
 }
 
 func (w *receiptWriter) begin(lease *poolLease) error {

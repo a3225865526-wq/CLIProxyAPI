@@ -233,6 +233,41 @@ func TestPG03ImagesExecutorPersistsBeforeSuccess(t *testing.T) {
 	}
 }
 
+// TestPG03ImagesQueryDistinguishesMissingFromBroken proves the zero-dispatch
+// proof cannot be forged by a storage fault: an absent attempt answers
+// found=false, while an unusable receipt store still returns an error. Letting
+// the two collapse would make the Gateway treat a broken store as proof that
+// nothing was sent, which is exactly the condition that authorizes a second
+// dispatch against another source.
+func TestPG03ImagesQueryDistinguishesMissingFromBroken(t *testing.T) {
+	t.Setenv("CLEARAPI_PG03_IMAGES", "true")
+	t.Setenv("CLEARAPI_PG03_IMAGES_POLICY_KEY", "synthetic-images-policy-key-012345678901234567890123")
+	t.Setenv("CLEARAPI_PG02_PROCESS_EPOCH", "00112233445566778899aabbccddeeff")
+
+	fixture := newImagesFixture(t, "success")
+
+	record, errMissing := fixture.manager.QueryImagesExecution("missing-request", "missing-attempt")
+	if errMissing != nil {
+		t.Fatalf("an absent attempt must answer found=false, not an error: %v", errMissing)
+	}
+	if record.Found {
+		t.Fatalf("an absent attempt reported found=true: %#v", record)
+	}
+	if record.RequestID != "missing-request" || record.AttemptID != "missing-attempt" {
+		t.Fatalf("the answer must echo the queried identity: %#v", record)
+	}
+
+	// A faulted receipt writer is a store failure, never a zero-dispatch proof.
+	guard := fixture.manager.poolGuard
+	if guard == nil || guard.receipts == nil {
+		t.Fatal("fixture has no receipt writer")
+	}
+	guard.receipts.faulted.Store(true)
+	if _, errBroken := fixture.manager.QueryImagesExecution("missing-request", "missing-attempt"); errBroken == nil {
+		t.Fatal("a faulted receipt store must not answer found=false")
+	}
+}
+
 // TestPG03ImagesRestartRecovery proves that a fresh process (new Manager, new
 // guards, same receipt/result directories) answers the durable question for an
 // existing attempt instead of dispatching again.
@@ -297,10 +332,16 @@ func TestPG03ImagesRestartRecovery(t *testing.T) {
 		t.Fatalf("restart could not recover the persisted payload: err=%v", errLoad)
 	}
 	// A different attempt for the same request has no record: recovery must
-	// report "not found" rather than inventing a new generation.
+	// report "not found" rather than inventing a new generation. This is also
+	// the trusted zero-dispatch proof the Gateway needs before it may hand a
+	// request over to another source, so it must be a successful answer with
+	// Found=false, NOT a store error.
 	missing, errMissing := restarted.QueryImagesExecution("images-request", "images-attempt-2")
-	if errMissing == nil {
-		t.Fatalf("unknown attempt unexpectedly resolved: %#v", missing)
+	if errMissing != nil {
+		t.Fatalf("a missing attempt must answer found=false, not an error: %v", errMissing)
+	}
+	if missing.Found || missing.State != "" || missing.ResultState != "" {
+		t.Fatalf("missing attempt must report found=false with no terminal state: %#v", missing)
 	}
 }
 
