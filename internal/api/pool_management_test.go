@@ -46,6 +46,7 @@ func TestPoolGuardServiceManagementRejectsAuthorizationImportAndProxy(t *testing
 		{http.MethodPost, "/v0/management/pool/trust/promote"},
 		{http.MethodPost, "/v0/management/pool/trust/revoke"},
 		{http.MethodGet, "/v0/management/pool/models"},
+		{http.MethodPost, "/v0/management/pool/import"},
 		{http.MethodPost, "/v0/management/pool/preflight"},
 		{http.MethodPost, "/v0/management/pool/models/grant"},
 		{http.MethodPost, "/v0/management/pool/models/revoke"},

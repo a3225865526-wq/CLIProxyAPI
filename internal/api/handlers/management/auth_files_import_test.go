@@ -48,8 +48,18 @@ func TestImportCredentialAtomicStoresAndReportsDigest(t *testing.T) {
 		t.Fatal("response leaked token material")
 	}
 	stored, err := os.ReadFile(filepath.Join(dir, "codex-synthetic.json"))
-	if err != nil || string(stored) != content {
-		t.Fatalf("stored credential mismatch: %v", err)
+	if err != nil {
+		t.Fatalf("read stored credential: %v", err)
+	}
+	var storedMetadata map[string]any
+	if err := json.Unmarshal(stored, &storedMetadata); err != nil {
+		t.Fatalf("stored credential is not JSON: %v", err)
+	}
+	if storedMetadata["disabled"] != true || storedMetadata["management_disabled"] != true {
+		t.Fatalf("imported credential is not durably isolated: %#v", storedMetadata)
+	}
+	if storedMetadata["access_token"] != "synthetic-access" || storedMetadata["refresh_token"] != "synthetic-refresh" {
+		t.Fatal("stored credential token fields changed")
 	}
 	info, err := os.Stat(filepath.Join(dir, "codex-synthetic.json"))
 	if err != nil || info.Mode().Perm()&0077 != 0 {

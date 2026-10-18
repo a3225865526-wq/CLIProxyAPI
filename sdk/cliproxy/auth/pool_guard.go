@@ -354,6 +354,16 @@ func (executor *poolExecutor) CloseExecutionSession(sessionID string) {
 	}
 }
 
+// PoolDispatchFencing must delegate to the wrapped provider. The pool wrapper
+// cannot implement the method unconditionally because eligibility belongs to
+// the concrete executor; it can only forward the provider capability.
+func (executor *poolExecutor) PoolDispatchFencing() bool {
+	if fenced, ok := executor.ProviderExecutor.(interface{ PoolDispatchFencing() bool }); ok {
+		return fenced.PoolDispatchFencing()
+	}
+	return false
+}
+
 func (executor *poolExecutor) ShouldPrepareRequestAuth(auth *Auth) bool {
 	preparer, ok := executor.ProviderExecutor.(RequestAuthPreparer)
 	return ok && preparer.ShouldPrepareRequestAuth(auth)

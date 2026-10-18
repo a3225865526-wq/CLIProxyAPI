@@ -17,9 +17,10 @@ import (
 )
 
 type poolProbeExecutor struct {
-	calls   atomic.Int32
-	stream  chan cliproxyexecutor.StreamChunk
-	failure bool
+	calls    atomic.Int32
+	stream   chan cliproxyexecutor.StreamChunk
+	failure  bool
+	unfenced bool
 }
 
 func TestStage74RetryReadsActualManagerAndOverride(t *testing.T) {
@@ -85,8 +86,25 @@ func TestStage74RetryReadsActualManagerAndOverride(t *testing.T) {
 	}
 }
 
-func (*poolProbeExecutor) PoolDispatchFencing() bool { return true }
-func (*poolProbeExecutor) Identifier() string        { return "codex" }
+// The zero value is fenced so unrelated fixtures keep their provider capability.
+// Only an explicit unfenced probe models an executor that cannot fence dispatch.
+func (e *poolProbeExecutor) PoolDispatchFencing() bool { return e != nil && !e.unfenced }
+func (*poolProbeExecutor) Identifier() string          { return "codex" }
+
+func TestPoolExecutorForwardsProviderDispatchFencing(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	fenced := &poolExecutor{ProviderExecutor: &poolProbeExecutor{}, manager: manager}
+	if !fenced.PoolDispatchFencing() {
+		t.Fatal("fenced provider capability was not forwarded")
+	}
+	unfenced := &poolExecutor{ProviderExecutor: &poolProbeExecutor{unfenced: true}, manager: manager}
+	if unfenced.PoolDispatchFencing() {
+		t.Fatal("unfenced provider capability was promoted")
+	}
+	if (&poolExecutor{ProviderExecutor: struct{ ProviderExecutor }{}, manager: manager}).PoolDispatchFencing() {
+		t.Fatal("executor without fencing capability was promoted")
+	}
+}
 func (e *poolProbeExecutor) Execute(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if err := cliproxyexecutor.BeforeUpstreamDispatch(ctx); err != nil {
 		return cliproxyexecutor.Response{}, err

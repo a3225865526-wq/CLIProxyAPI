@@ -133,6 +133,25 @@ func (h *Handler) ImportCredentialAtomic(c *gin.Context) {
 	auth.Attributes["source"] = target
 	auth.Metadata = metadata
 	coreauth.NormalizeCredentialMetadata(auth.Metadata)
+	// Pool imports are quarantined at rest: the file becomes schedulable only
+	// after the operator separately grants and promotes the exact identity.
+	// This mirrors saveTokenRecord and keeps a crashed import fail-closed.
+	auth.Disabled = true
+	auth.Status = coreauth.StatusDisabled
+	auth.Metadata["disabled"] = true
+	auth.Metadata[coreauth.ManagementDisabledKey] = true
+	// Persist the quarantine fence in the credential file itself. Registering
+	// only the in-memory record would allow a restart to reintroduce unmarked
+	// raw bytes from the target path.
+	storedRaw, errMarshal := json.Marshal(auth.Metadata)
+	if errMarshal != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "import failed"})
+		return
+	}
+	if errWrite := replaceImportFileAtomic(target, storedRaw); errWrite != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "import failed"})
+		return
+	}
 	if err := h.upsertAuthRecord(c.Request.Context(), auth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "import failed"})
 		return
@@ -164,6 +183,40 @@ func (h *Handler) ImportCredentialAtomic(c *gin.Context) {
 func deleteImportedFile(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	return nil
+}
+
+func replaceImportFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".pool-import-rewrite-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	cleanup := func() {
+		_ = temp.Close()
+		_ = os.Remove(tempName)
+	}
+	if errChmod := temp.Chmod(0o600); errChmod != nil {
+		cleanup()
+		return errChmod
+	}
+	if _, errWrite := temp.Write(data); errWrite != nil {
+		cleanup()
+		return errWrite
+	}
+	if errSync := temp.Sync(); errSync != nil {
+		cleanup()
+		return errSync
+	}
+	if errClose := temp.Close(); errClose != nil {
+		_ = os.Remove(tempName)
+		return errClose
+	}
+	if errRename := os.Rename(tempName, path); errRename != nil {
+		_ = os.Remove(tempName)
+		return errRename
 	}
 	return nil
 }
