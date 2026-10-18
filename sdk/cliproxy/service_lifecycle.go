@@ -88,6 +88,17 @@ func (s *Service) Run(ctx context.Context) error {
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
 		})
+		// A service-role pool publishes models only from explicit trust and
+		// capability commits, so a restart would otherwise come back with an
+		// empty pool registry and refuse every request until an operator
+		// mutates policy again. Re-derive the publication from the durable
+		// grant file at startup; this only re-reads committed state and never
+		// promotes trust or capability.
+		if s.coreManager.PoolRole() == "service" {
+			if errSync := s.syncPoolRegistry(ctx); errSync != nil {
+				log.Errorf("failed to publish committed pool models at startup: %v", errSync)
+			}
+		}
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
